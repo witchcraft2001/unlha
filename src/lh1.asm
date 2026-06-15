@@ -13,12 +13,15 @@ LH1_T           EQU 627             ; NCHAR*2-1
 LH1_R           EQU 626             ; корень
 LH1_MAXFREQ     EQU #8000
 
-; Таблицы в выделенных страницах WIN2 (#8000-#BFFF) и WIN3 (#C000-).
-TextBufBase     EQU #8000           ; окно 4096 байт
-FreqBase        EQU #9000           ; freq[T+1] слов
-SonBase         EQU #9600           ; son[T] слов
-PrntBase        EQU #A000           ; prnt[T+NCHAR] слов
-Lh1OutBuf       EQU #C000           ; выходной буфер 4096 (WIN3)
+; Рабочие массивы lh1 — в SRAM WIN0 (этап 5B): декод держит CASH_ON, поэтому
+; обращения к дереву идут без wait-состояний. Выходной буфер остаётся в WIN3
+; (#C000), т.к. сбрасывается через DSS (вне кэша). Раскладка не пересекается
+; с CRC-таблицей (#3800) — проверяется ASSERT в cache.asm.
+TextBufBase     EQU #0000           ; окно 4096 байт (SRAM)
+FreqBase        EQU #1000           ; freq[T+1] слов  (628*2 -> #1000-#14E7)
+SonBase         EQU #1500           ; son[T] слов      (627*2 -> #1500-#19E5)
+PrntBase        EQU #1A00           ; prnt[T+NCHAR] слов (941*2 -> #1A00-#2179)
+Lh1OutBuf       EQU #C000           ; выходной буфер 4096 (WIN3, не кэш)
 Lh1OutBufLen    EQU 4096
 
 ; ====================================================================
@@ -35,8 +38,14 @@ DecodeLh1:
         LD      HL,0
         LD      (Crc16),HL
         LD      (Lh1OutPos),HL
-        CALL    Lh1InitWindow
-        CALL    StartHuff
+        ; --- войти в кэш и держать CASH_ON весь декод (массивы дерева в SRAM).
+        ; DSS-init выше (GetFilePos/InitBitReader) сделан вне кэша. Дальше DSS
+        ; только на границах RefillInBuf/Lh1Flush — они трамплинятся по CacheHeld.
+        LD      A,1
+        LD      (CacheHeld),A
+        CALL    EnterCacheWindow
+        CALL    Lh1InitWindow               ; пишет SRAM TextBuf (CASH_ON)
+        CALL    StartHuff                   ; пишет SRAM freq/son/prnt (CASH_ON)
 .loop:
         CALL    RemainingZero
         JR      Z,.done
@@ -87,7 +96,10 @@ DecodeLh1:
         JR      Z,.done
         JR      .copy
 .done:
-        CALL    Lh1Flush
+        CALL    Lh1Flush                    ; сброс остатка (трамплинит DSS-запись)
+        CALL    RestoreSystemWindow         ; выйти из кэша (делает EI)
+        XOR     A
+        LD      (CacheHeld),A
         RET
 
 ; Окно: text_buf[0..N-F-1] = ' '(0x20), r = N-F.
@@ -158,13 +170,20 @@ Lh1Flush:
         RET     Z
         LD      BC,(Lh1OutPos)
         LD      HL,Lh1OutBuf
-        CALL    Crc16Update
+        CALL    Crc16Update                 ; cache-aware (прямой CacheCrc16 в кэше)
+        ; --- DSS-запись: вне кэша, если он держится (CacheHeld) ---
+        LD      A,(CacheHeld)
+        OR      A
+        CALL    NZ,RestoreSystemWindow
         LD      DE,(Lh1OutPos)
         LD      HL,Lh1OutBuf
         LD      A,(OutHandle)
         LD      C,Dss.Write
         RST     Dss.Rst
         CALL    MapDataPages
+        LD      A,(CacheHeld)
+        OR      A
+        CALL    NZ,EnterCacheWindow
         RET
 
 ; ====================================================================

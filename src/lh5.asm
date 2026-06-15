@@ -325,6 +325,10 @@ RefillInBuf:                                ; CF=1 если данных бол�
         JR      Z,.none
         CALL    CompInChunk                 ; BC = min(CompRemaining, InBufLen)
         PUSH    BC
+        ; --- DSS-чтение: вне кэша, если он держится декодером (CacheHeld) ---
+        LD      A,(CacheHeld)
+        OR      A
+        CALL    NZ,RestoreSystemWindow
         LD      HL,InBufBase
         LD      D,B
         LD      E,C
@@ -332,6 +336,9 @@ RefillInBuf:                                ; CF=1 если данных бол�
         LD      C,Dss.Read
         RST     Dss.Rst
         CALL    MapDataPages
+        LD      A,(CacheHeld)
+        OR      A
+        CALL    NZ,EnterCacheWindow
         POP     BC
         LD      (InCnt),BC
         LD      HL,0

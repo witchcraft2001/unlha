@@ -31,6 +31,8 @@ Start:
         XOR     A
         LD      (ExitCode),A
 
+        CALL    InitSramBundle              ; SRAM: кэш-код + таблица CRC16
+
         LD      HL,MsgBanner
         CALL    PrintString
 
@@ -981,37 +983,19 @@ SubChunk:                                   ; Remaining -= ChunkLen
         RET
 
 ; CRC-16/ARC (poly 0xA001, init 0). HL=буфер, BC=кол-во. Обновляет (Crc16).
+; CRC16/ARC по BC байтам из HL -> (Crc16). Таблично, из SRAM-кэша (WIN0):
+; ~8x меньше операций, чем побитово, и без wait-состояний. Кэш входит/выходит
+; вокруг SRAM-процедуры; DSS-ввод-вывод должен быть вне этого окна.
 Crc16Update:
         LD      A,B
         OR      C
         RET     Z
-        LD      DE,(Crc16)
-.next:
-        LD      A,(HL)
-        XOR     E
-        LD      E,A
-        PUSH    BC
-        LD      B,8
-.bit:
-        SRL     D
-        RR      E
-        JR      NC,.noXor
-        LD      A,D
-        XOR     #A0
-        LD      D,A
-        LD      A,E
-        XOR     #01
-        LD      E,A
-.noXor:
-        DJNZ    .bit
-        POP     BC
-        INC     HL
-        DEC     BC
-        LD      A,B
-        OR      C
-        JR      NZ,.next
-        LD      (Crc16),DE
-        RET
+        LD      A,(CacheHeld)               ; кэш уже держится декодером?
+        OR      A
+        JP      NZ,CacheCrc16Update         ; да -> прямой вызов (без Enter/Restore)
+        CALL    EnterCacheWindow
+        CALL    CacheCrc16Update            ; SRAM #3A00
+        JP      RestoreSystemWindow         ; tail (делает EI), RET вызвавшему
 
 ; Сверка CRC16, печать результата, код возврата.
 VerifyCrc:
@@ -1336,6 +1320,7 @@ CloseListFile:
 
         INCLUDE "lh5.asm"
         INCLUDE "lh1.asm"
+        INCLUDE "cache.asm"
 
 ; ====================================================================
 ; Сообщения
@@ -1417,6 +1402,7 @@ ExpectedCrc:    DS      2
 ExtSize:        DS      2
 ChunkLen:       DS      2
 Crc16:          DS      2
+CacheHeld:      DB      0           ; 1 = декодер держит SRAM-кэш (CASH_ON), DSS трамплинить
 
 ParamBuf:       DS      128
 ArchivePath:    DS      128

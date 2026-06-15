@@ -1,0 +1,754 @@
+; ====================================================================
+;   Декодер -lh1- (LZHUF): LZSS + адаптивный Хаффман, окно 4 КБ.
+;   Порт проверенного Python-эталона (LZHUF.C). Этап 4.
+; ====================================================================
+; Использует из lh5.asm: GetFilePos, CalcCompRemaining, InitBitReader,
+; GetBits, RemainingZero, MapDataPages; из unlha.asm: Crc16Update.
+
+LH1_N           EQU 4096
+LH1_F           EQU 60
+LH1_THRESH      EQU 2
+LH1_NCHAR       EQU 314             ; 256 - THRESHOLD + F
+LH1_T           EQU 627             ; NCHAR*2-1
+LH1_R           EQU 626             ; корень
+LH1_MAXFREQ     EQU #8000
+
+; Таблицы в выделенных страницах WIN2 (#8000-#BFFF) и WIN3 (#C000-).
+TextBufBase     EQU #8000           ; окно 4096 байт
+FreqBase        EQU #9000           ; freq[T+1] слов
+SonBase         EQU #9600           ; son[T] слов
+PrntBase        EQU #A000           ; prnt[T+NCHAR] слов
+Lh1OutBuf       EQU #C000           ; выходной буфер 4096 (WIN3)
+Lh1OutBufLen    EQU 4096
+
+; ====================================================================
+DecodeLh1:
+        CALL    GetFilePos
+        LD      (DataStart),IX
+        LD      (DataStart+2),HL
+        CALL    CalcCompRemaining
+        CALL    InitBitReader
+        LD      HL,(HdrBuf+#0B)
+        LD      (Remaining),HL
+        LD      HL,(HdrBuf+#0D)
+        LD      (Remaining+2),HL
+        LD      HL,0
+        LD      (Crc16),HL
+        LD      (Lh1OutPos),HL
+        CALL    Lh1InitWindow
+        CALL    StartHuff
+.loop:
+        CALL    RemainingZero
+        JR      Z,.done
+        CALL    DecodeChar                  ; HL = c
+        LD      A,H
+        OR      A
+        JR      NZ,.match                   ; c >= 256
+        LD      A,L
+        CALL    Lh1PutByte
+        JR      .loop
+.match:
+        LD      DE,255-LH1_THRESH           ; len = c - 255 + THRESHOLD = c-253
+        OR      A
+        SBC     HL,DE
+        LD      (Lh1Len),HL
+        CALL    DecodePosition              ; HL = pos
+        EX      DE,HL                       ; DE = pos
+        LD      HL,(Lh1R)                   ; i = (r - pos - 1) & (N-1)
+        OR      A
+        SBC     HL,DE
+        DEC     HL
+        LD      A,H
+        AND     #0F
+        LD      H,A
+        LD      (Lh1MatchI),HL
+        LD      BC,(Lh1Len)
+.copy:
+        LD      A,B
+        OR      C
+        JR      Z,.loop
+        PUSH    BC
+        LD      HL,(Lh1MatchI)
+        LD      DE,TextBufBase
+        ADD     HL,DE
+        LD      A,(HL)
+        LD      E,A
+        LD      HL,(Lh1MatchI)
+        INC     HL
+        LD      A,H
+        AND     #0F
+        LD      H,A
+        LD      (Lh1MatchI),HL
+        LD      A,E
+        CALL    Lh1PutByte
+        POP     BC
+        DEC     BC
+        CALL    RemainingZero
+        JR      Z,.done
+        JR      .copy
+.done:
+        CALL    Lh1Flush
+        RET
+
+; Окно: text_buf[0..N-F-1] = ' '(0x20), r = N-F.
+Lh1InitWindow:
+        LD      HL,TextBufBase
+        LD      (HL),#20
+        LD      DE,TextBufBase+1
+        LD      BC,LH1_N-LH1_F-1
+        LDIR
+        LD      HL,LH1_N-LH1_F
+        LD      (Lh1R),HL
+        RET
+
+; ====================================================================
+; Вывод байта: в окно + в выходной буфер (с flush), Remaining--.
+; ====================================================================
+Lh1PutByte:
+        PUSH    AF
+        LD      HL,(Lh1R)                   ; text_buf[r] = A
+        LD      DE,TextBufBase
+        ADD     HL,DE
+        POP     AF
+        PUSH    AF
+        LD      (HL),A
+        LD      HL,(Lh1R)                   ; r = (r+1) & (N-1)
+        INC     HL
+        LD      A,H
+        AND     #0F
+        LD      H,A
+        LD      (Lh1R),HL
+        LD      HL,(Lh1OutPos)              ; out_buf[outpos] = A
+        LD      DE,Lh1OutBuf
+        ADD     HL,DE
+        POP     AF
+        LD      (HL),A
+        LD      HL,(Lh1OutPos)
+        INC     HL
+        LD      (Lh1OutPos),HL
+        LD      A,H
+        CP      high(Lh1OutBufLen)          ; буфер полон (4096) ?
+        JR      NZ,.nf
+        CALL    Lh1Flush
+        LD      HL,0
+        LD      (Lh1OutPos),HL
+.nf:
+        LD      HL,Remaining                ; Remaining--
+        LD      A,(HL)
+        SUB     1
+        LD      (HL),A
+        INC     HL
+        LD      A,(HL)
+        SBC     A,0
+        LD      (HL),A
+        INC     HL
+        LD      A,(HL)
+        SBC     A,0
+        LD      (HL),A
+        INC     HL
+        LD      A,(HL)
+        SBC     A,0
+        LD      (HL),A
+        RET
+
+Lh1Flush:
+        LD      HL,(Lh1OutPos)
+        LD      A,H
+        OR      L
+        RET     Z
+        LD      BC,(Lh1OutPos)
+        LD      HL,Lh1OutBuf
+        CALL    Crc16Update
+        LD      DE,(Lh1OutPos)
+        LD      HL,Lh1OutBuf
+        LD      A,(OutHandle)
+        LD      C,Dss.Write
+        RST     Dss.Rst
+        CALL    MapDataPages
+        RET
+
+; ====================================================================
+; Доступ к словным массивам: HL=индекс, DE=база.
+; ====================================================================
+Lh1GetWord:                                 ; -> HL = word[index]; сохраняет DE
+        ADD     HL,HL
+        ADD     HL,DE
+        LD      A,(HL)
+        INC     HL
+        LD      H,(HL)
+        LD      L,A
+        RET
+
+Lh1PutWord:                                 ; HL=index, DE=база, BC=значение
+        ADD     HL,HL
+        ADD     HL,DE
+        LD      (HL),C
+        INC     HL
+        LD      (HL),B
+        RET
+
+; ====================================================================
+; StartHuff — инициализация дерева.
+; ====================================================================
+StartHuff:
+        ; freq[0..NCHAR-1] = 1
+        LD      HL,FreqBase
+        LD      DE,LH1_NCHAR
+.f1:
+        LD      (HL),1
+        INC     HL
+        LD      (HL),0
+        INC     HL
+        DEC     DE
+        LD      A,D
+        OR      E
+        JR      NZ,.f1
+        ; son[i] = i + T  (i = 0..NCHAR-1)
+        LD      HL,SonBase
+        LD      DE,LH1_T
+        LD      BC,LH1_NCHAR
+.f2:
+        LD      (HL),E
+        INC     HL
+        LD      (HL),D
+        INC     HL
+        INC     DE
+        DEC     BC
+        LD      A,B
+        OR      C
+        JR      NZ,.f2
+        ; prnt[T+i] = i
+        LD      HL,PrntBase + LH1_T*2
+        LD      DE,0
+        LD      BC,LH1_NCHAR
+.f3:
+        LD      (HL),E
+        INC     HL
+        LD      (HL),D
+        INC     HL
+        INC     DE
+        DEC     BC
+        LD      A,B
+        OR      C
+        JR      NZ,.f3
+        ; внутренние узлы: i=0, j=NCHAR; while j<=R
+        LD      HL,LH1_NCHAR
+        LD      (Lh1J),HL
+        LD      HL,0
+        LD      (Lh1I),HL
+.in:
+        LD      HL,(Lh1J)
+        LD      DE,LH1_R
+        OR      A
+        SBC     HL,DE
+        JR      Z,.ineq
+        JR      NC,.indone                  ; j > R
+.ineq:
+        LD      HL,(Lh1I)                   ; freq[j] = freq[i]+freq[i+1]
+        LD      DE,FreqBase
+        CALL    Lh1GetWord
+        PUSH    HL
+        LD      HL,(Lh1I)
+        INC     HL
+        LD      DE,FreqBase
+        CALL    Lh1GetWord
+        POP     DE
+        ADD     HL,DE
+        LD      B,H
+        LD      C,L
+        LD      HL,(Lh1J)
+        LD      DE,FreqBase
+        CALL    Lh1PutWord
+        LD      BC,(Lh1I)                   ; son[j] = i
+        LD      HL,(Lh1J)
+        LD      DE,SonBase
+        CALL    Lh1PutWord
+        LD      BC,(Lh1J)                   ; prnt[i] = j
+        LD      HL,(Lh1I)
+        LD      DE,PrntBase
+        CALL    Lh1PutWord
+        LD      BC,(Lh1J)                   ; prnt[i+1] = j
+        LD      HL,(Lh1I)
+        INC     HL
+        LD      DE,PrntBase
+        CALL    Lh1PutWord
+        LD      HL,(Lh1I)                   ; i += 2
+        INC     HL
+        INC     HL
+        LD      (Lh1I),HL
+        LD      HL,(Lh1J)                   ; j++
+        INC     HL
+        LD      (Lh1J),HL
+        JR      .in
+.indone:
+        LD      HL,LH1_T                    ; freq[T] = 0xFFFF
+        LD      DE,FreqBase
+        LD      BC,#FFFF
+        CALL    Lh1PutWord
+        LD      HL,LH1_R                    ; prnt[R] = 0
+        LD      DE,PrntBase
+        LD      BC,0
+        CALL    Lh1PutWord
+        RET
+
+; ====================================================================
+; DecodeChar -> HL = c (0..NCHAR-1).
+; ====================================================================
+DecodeChar:
+        LD      HL,LH1_R                    ; c = son[R]
+        LD      DE,SonBase
+        CALL    Lh1GetWord
+.walk:
+        LD      DE,LH1_T                    ; while c < T
+        PUSH    HL
+        OR      A
+        SBC     HL,DE
+        POP     HL
+        JR      NC,.leaf                    ; c >= T
+        PUSH    HL                          ; c = son[c + bit]
+        LD      B,1
+        CALL    GetBits
+        LD      A,L
+        POP     HL
+        ADD     A,L
+        LD      L,A
+        LD      A,0
+        ADC     A,H
+        LD      H,A
+        LD      DE,SonBase
+        CALL    Lh1GetWord
+        JR      .walk
+.leaf:
+        LD      DE,LH1_T                    ; c -= T
+        OR      A
+        SBC     HL,DE
+        PUSH    HL                          ; символ-возврат (Lh1Update портит Lh1Cv)
+        LD      (Lh1Cv),HL                  ; вход для Lh1Update
+        CALL    Lh1Update
+        POP     HL                          ; вернуть исходный символ
+        RET
+
+; ====================================================================
+; DecodePosition -> HL = position (0..N-1).
+; ====================================================================
+DecodePosition:
+        LD      B,8
+        CALL    GetBits                     ; i = байт
+        LD      A,L
+        LD      (Lh1I8),A
+        LD      H,0                          ; c = d_code[i] << 6
+        LD      L,A
+        LD      DE,Lh1DCode
+        ADD     HL,DE
+        LD      A,(HL)
+        LD      H,0
+        LD      L,A
+        ADD     HL,HL
+        ADD     HL,HL
+        ADD     HL,HL
+        ADD     HL,HL
+        ADD     HL,HL
+        ADD     HL,HL
+        LD      (Lh1C),HL
+        LD      A,(Lh1I8)                   ; i (16-бит) = байт
+        LD      L,A
+        LD      H,0
+        LD      (Lh1Pos),HL
+        LD      A,(Lh1I8)                   ; j = d_len[i] - 2
+        LD      L,A
+        LD      H,0
+        LD      DE,Lh1DLen
+        ADD     HL,DE
+        LD      A,(HL)
+        SUB     2
+        LD      (Lh1JBits),A
+.lp:
+        LD      A,(Lh1JBits)
+        OR      A
+        JR      Z,.fin
+        DEC     A
+        LD      (Lh1JBits),A
+        LD      HL,(Lh1Pos)                 ; i <<= 1
+        ADD     HL,HL
+        LD      (Lh1Pos),HL
+        LD      B,1
+        CALL    GetBits                     ; bit
+        LD      A,L
+        OR      A
+        JR      Z,.lp
+        LD      HL,(Lh1Pos)                 ; i |= 1
+        SET     0,L
+        LD      (Lh1Pos),HL
+        JR      .lp
+.fin:
+        LD      HL,(Lh1Pos)                 ; return c | (i & 0x3F)
+        LD      A,L
+        AND     #3F
+        LD      L,A
+        LD      H,0
+        LD      DE,(Lh1C)
+        ADD     HL,DE
+        RET
+
+; ====================================================================
+; update(c) — частоты и реструктуризация.
+; ====================================================================
+Lh1Update:
+        LD      HL,LH1_R                    ; if freq[R]==MAX_FREQ: reconst
+        LD      DE,FreqBase
+        CALL    Lh1GetWord
+        LD      DE,LH1_MAXFREQ
+        OR      A
+        SBC     HL,DE
+        JR      NZ,.nrec
+        CALL    Lh1Reconst
+.nrec:
+        LD      HL,(Lh1Cv)                  ; c = prnt[c+T]
+        LD      DE,LH1_T
+        ADD     HL,DE
+        LD      DE,PrntBase
+        CALL    Lh1GetWord
+        LD      (Lh1Cv),HL
+.uloop:
+        LD      HL,(Lh1Cv)                  ; k = ++freq[c]
+        LD      DE,FreqBase
+        CALL    Lh1GetWord
+        INC     HL
+        LD      (Lh1K),HL
+        LD      B,H
+        LD      C,L
+        LD      HL,(Lh1Cv)
+        LD      DE,FreqBase
+        CALL    Lh1PutWord
+        LD      HL,(Lh1Cv)                  ; l = c+1
+        INC     HL
+        LD      (Lh1L),HL
+        LD      DE,FreqBase                 ; freq[l]
+        CALL    Lh1GetWord
+        LD      DE,(Lh1K)                   ; k > freq[l] ?
+        EX      DE,HL                       ; HL=k, DE=freq[l]
+        OR      A
+        SBC     HL,DE
+        JR      Z,.noswap
+        JR      C,.noswap
+        CALL    Lh1UpdateSwap
+.noswap:
+        LD      HL,(Lh1Cv)                  ; c = prnt[c]
+        LD      DE,PrntBase
+        CALL    Lh1GetWord
+        LD      (Lh1Cv),HL
+        LD      A,H
+        OR      L
+        JR      NZ,.uloop
+        RET
+
+Lh1UpdateSwap:
+.fl:
+        LD      HL,(Lh1L)                   ; while k > freq[l+1]: l++
+        INC     HL
+        LD      DE,FreqBase
+        CALL    Lh1GetWord
+        LD      DE,(Lh1K)
+        EX      DE,HL                       ; HL=k, DE=freq[l+1]
+        OR      A
+        SBC     HL,DE
+        JR      Z,.fld
+        JR      C,.fld
+        LD      HL,(Lh1L)
+        INC     HL
+        LD      (Lh1L),HL
+        JR      .fl
+.fld:
+        LD      HL,(Lh1L)                   ; freq[c] = freq[l]
+        LD      DE,FreqBase
+        CALL    Lh1GetWord
+        LD      B,H
+        LD      C,L
+        LD      HL,(Lh1Cv)
+        LD      DE,FreqBase
+        CALL    Lh1PutWord
+        LD      BC,(Lh1K)                   ; freq[l] = k
+        LD      HL,(Lh1L)
+        LD      DE,FreqBase
+        CALL    Lh1PutWord
+        LD      HL,(Lh1Cv)                  ; i = son[c]
+        LD      DE,SonBase
+        CALL    Lh1GetWord
+        LD      (Lh1Ti),HL
+        LD      BC,(Lh1L)                   ; prnt[i] = l
+        LD      HL,(Lh1Ti)
+        LD      DE,PrntBase
+        CALL    Lh1PutWord
+        LD      HL,(Lh1Ti)                  ; if i<T: prnt[i+1]=l
+        LD      DE,LH1_T
+        OR      A
+        SBC     HL,DE
+        JR      NC,.skip1
+        LD      BC,(Lh1L)
+        LD      HL,(Lh1Ti)
+        INC     HL
+        LD      DE,PrntBase
+        CALL    Lh1PutWord
+.skip1:
+        LD      HL,(Lh1L)                   ; jj = son[l]
+        LD      DE,SonBase
+        CALL    Lh1GetWord
+        LD      (Lh1Tj),HL
+        LD      BC,(Lh1Ti)                  ; son[l] = i
+        LD      HL,(Lh1L)
+        LD      DE,SonBase
+        CALL    Lh1PutWord
+        LD      BC,(Lh1Cv)                  ; prnt[jj] = c
+        LD      HL,(Lh1Tj)
+        LD      DE,PrntBase
+        CALL    Lh1PutWord
+        LD      HL,(Lh1Tj)                  ; if jj<T: prnt[jj+1]=c
+        LD      DE,LH1_T
+        OR      A
+        SBC     HL,DE
+        JR      NC,.skip2
+        LD      BC,(Lh1Cv)
+        LD      HL,(Lh1Tj)
+        INC     HL
+        LD      DE,PrntBase
+        CALL    Lh1PutWord
+.skip2:
+        LD      BC,(Lh1Tj)                  ; son[c] = jj
+        LD      HL,(Lh1Cv)
+        LD      DE,SonBase
+        CALL    Lh1PutWord
+        LD      HL,(Lh1L)                   ; c = l
+        LD      (Lh1Cv),HL
+        RET
+
+; ====================================================================
+; reconst — перестройка дерева (freq[R] достиг MAX_FREQ).
+; ====================================================================
+Lh1Reconst:
+        ; фаза 1: собрать листья
+        LD      HL,0
+        LD      (Lh1Rj),HL
+        LD      (Lh1Ri),HL
+.p1:
+        LD      HL,(Lh1Ri)
+        LD      DE,LH1_T
+        OR      A
+        SBC     HL,DE
+        JR      NC,.p1d
+        LD      HL,(Lh1Ri)                  ; son[i]
+        LD      DE,SonBase
+        CALL    Lh1GetWord
+        LD      (Lh1Tson),HL
+        LD      DE,LH1_T
+        OR      A
+        SBC     HL,DE
+        JR      C,.p1n                      ; son[i] < T -> пропуск
+        LD      HL,(Lh1Ri)                  ; freq[j] = (freq[i]+1)/2
+        LD      DE,FreqBase
+        CALL    Lh1GetWord
+        INC     HL
+        SRL     H
+        RR      L
+        LD      B,H
+        LD      C,L
+        LD      HL,(Lh1Rj)
+        LD      DE,FreqBase
+        CALL    Lh1PutWord
+        LD      BC,(Lh1Tson)                ; son[j] = son[i]
+        LD      HL,(Lh1Rj)
+        LD      DE,SonBase
+        CALL    Lh1PutWord
+        LD      HL,(Lh1Rj)                  ; j++
+        INC     HL
+        LD      (Lh1Rj),HL
+.p1n:
+        LD      HL,(Lh1Ri)
+        INC     HL
+        LD      (Lh1Ri),HL
+        JR      .p1
+.p1d:
+        ; фаза 2: построить внутренние узлы
+        LD      HL,0
+        LD      (Lh1Ri),HL
+        LD      HL,LH1_NCHAR
+        LD      (Lh1Rj),HL
+.p2:
+        LD      HL,(Lh1Rj)
+        LD      DE,LH1_T
+        OR      A
+        SBC     HL,DE
+        JP      NC,.p2d
+        LD      HL,(Lh1Ri)                  ; f = freq[i] + freq[i+1]
+        LD      DE,FreqBase
+        CALL    Lh1GetWord
+        PUSH    HL
+        LD      HL,(Lh1Ri)
+        INC     HL
+        LD      DE,FreqBase
+        CALL    Lh1GetWord
+        POP     DE
+        ADD     HL,DE
+        LD      (Lh1Rf),HL
+        LD      B,H                         ; freq[j] = f
+        LD      C,L
+        LD      HL,(Lh1Rj)
+        LD      DE,FreqBase
+        CALL    Lh1PutWord
+        LD      HL,(Lh1Rj)                  ; k = j-1; while f < freq[k]: k--
+        DEC     HL
+        LD      (Lh1Rk),HL
+.fk:
+        LD      HL,(Lh1Rk)
+        LD      DE,FreqBase
+        CALL    Lh1GetWord
+        LD      DE,(Lh1Rf)
+        EX      DE,HL                       ; HL=f, DE=freq[k]
+        OR      A
+        SBC     HL,DE
+        JR      NC,.fkd                     ; f >= freq[k] -> стоп
+        LD      HL,(Lh1Rk)
+        DEC     HL
+        LD      (Lh1Rk),HL
+        JR      .fk
+.fkd:
+        LD      HL,(Lh1Rk)                  ; k++
+        INC     HL
+        LD      (Lh1Rk),HL
+        ; сдвиг freq[k..j-1] -> freq[k+1..j] (count = j-k слов, LDDR)
+        LD      HL,(Lh1Rj)
+        LD      DE,(Lh1Rk)
+        OR      A
+        SBC     HL,DE
+        LD      (Lh1Rcnt),HL                ; count = j-k
+        LD      A,H
+        OR      L
+        JR      Z,.fshift_f_done
+        LD      HL,(Lh1Rj)                  ; src = старший байт freq[j-1]
+        DEC     HL
+        ADD     HL,HL
+        LD      DE,FreqBase
+        ADD     HL,DE
+        INC     HL                          ; LDDR копирует сверху вниз
+        LD      (Lh1Rsrc),HL
+        LD      HL,(Lh1Rj)                  ; dst = старший байт freq[j]
+        ADD     HL,HL
+        LD      DE,FreqBase
+        ADD     HL,DE
+        INC     HL
+        EX      DE,HL                       ; DE = dst
+        LD      HL,(Lh1Rsrc)
+        LD      BC,(Lh1Rcnt)
+        SLA     C                           ; *2 байт
+        RL      B
+        LDDR
+.fshift_f_done:
+        LD      BC,(Lh1Rf)                  ; freq[k] = f
+        LD      HL,(Lh1Rk)
+        LD      DE,FreqBase
+        CALL    Lh1PutWord
+        LD      HL,(Lh1Rcnt)                ; сдвиг son аналогично
+        LD      A,H
+        OR      L
+        JR      Z,.fshift_s_done
+        LD      HL,(Lh1Rj)                  ; src = старший байт son[j-1]
+        DEC     HL
+        ADD     HL,HL
+        LD      DE,SonBase
+        ADD     HL,DE
+        INC     HL
+        LD      (Lh1Rsrc),HL
+        LD      HL,(Lh1Rj)                  ; dst = старший байт son[j]
+        ADD     HL,HL
+        LD      DE,SonBase
+        ADD     HL,DE
+        INC     HL
+        EX      DE,HL
+        LD      HL,(Lh1Rsrc)
+        LD      BC,(Lh1Rcnt)
+        SLA     C
+        RL      B
+        LDDR
+.fshift_s_done:
+        LD      BC,(Lh1Ri)                  ; son[k] = i
+        LD      HL,(Lh1Rk)
+        LD      DE,SonBase
+        CALL    Lh1PutWord
+        LD      HL,(Lh1Ri)                  ; i += 2
+        INC     HL
+        INC     HL
+        LD      (Lh1Ri),HL
+        LD      HL,(Lh1Rj)                  ; j++
+        INC     HL
+        LD      (Lh1Rj),HL
+        JP      .p2
+.p2d:
+        ; фаза 3: восстановить prnt
+        LD      HL,0
+        LD      (Lh1Ri),HL
+.p3:
+        LD      HL,(Lh1Ri)
+        LD      DE,LH1_T
+        OR      A
+        SBC     HL,DE
+        JR      NC,.p3d
+        LD      HL,(Lh1Ri)                  ; k = son[i]
+        LD      DE,SonBase
+        CALL    Lh1GetWord
+        LD      (Lh1Rk),HL
+        LD      DE,LH1_T
+        OR      A
+        SBC     HL,DE
+        JR      NC,.p3big                   ; k >= T
+        LD      BC,(Lh1Ri)                  ; prnt[k] = i ; prnt[k+1] = i
+        LD      HL,(Lh1Rk)
+        LD      DE,PrntBase
+        CALL    Lh1PutWord
+        LD      BC,(Lh1Ri)
+        LD      HL,(Lh1Rk)
+        INC     HL
+        LD      DE,PrntBase
+        CALL    Lh1PutWord
+        JR      .p3n
+.p3big:
+        LD      BC,(Lh1Ri)                  ; prnt[k] = i
+        LD      HL,(Lh1Rk)
+        LD      DE,PrntBase
+        CALL    Lh1PutWord
+.p3n:
+        LD      HL,(Lh1Ri)
+        INC     HL
+        LD      (Lh1Ri),HL
+        JR      .p3
+.p3d:
+        RET
+
+; ====================================================================
+; Статические таблицы позиций (в WIN1, читаются напрямую).
+; ====================================================================
+        INCLUDE "dtables.inc"
+
+; ====================================================================
+; Переменные -lh1- (WIN1).
+; ====================================================================
+Lh1R:           DW      0
+Lh1OutPos:      DW      0
+Lh1Len:         DW      0
+Lh1MatchI:      DW      0
+Lh1I:           DW      0
+Lh1J:           DW      0
+Lh1Cv:          DW      0
+Lh1K:           DW      0
+Lh1L:           DW      0
+Lh1Ti:          DW      0
+Lh1Tj:          DW      0
+Lh1Pos:         DW      0
+Lh1C:           DW      0
+Lh1I8:          DB      0
+Lh1JBits:       DB      0
+Lh1Ri:          DW      0
+Lh1Rj:          DW      0
+Lh1Rk:          DW      0
+Lh1Rf:          DW      0
+Lh1Rcnt:        DW      0
+Lh1Rsrc:        DW      0
+Lh1Tson:        DW      0

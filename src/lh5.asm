@@ -240,42 +240,58 @@ GetBits:
         RET
 
 ; FillBuf(B=n): сдвинуть BitBuf влево на n, втянув n новых бит.
+; FillBuf(B=n): втянуть n бит в BitBuf (побайтовая модель LHA).
+; Состояние в регистрах: HL=BitBuf, D=InCur (валидные биты сверху), E=InBitsLeft.
+; Биты k-чанка вносятся плотным циклом SLA D / ADC HL,HL (без вызовов на бит).
 FillBuf:
         LD      A,B
         OR      A
         RET     Z
-        PUSH    BC
-        PUSH    DE
-.l:
-        CALL    NextInBit                   ; CF = бит
         LD      HL,(BitBuf)
-        ADC     HL,HL
-        LD      (BitBuf),HL
-        DJNZ    .l
-        POP     DE
-        POP     BC
-        RET
-
-NextInBit:                                  ; CF = следующий бит входа
+        LD      A,(InCur)
+        LD      D,A
         LD      A,(InBitsLeft)
+        LD      E,A
+.loop:
+        LD      A,E                         ; нужен новый байт?
         OR      A
         JR      NZ,.have
-        PUSH    BC
+        PUSH    HL                          ; refill (редко) — InByte портит регистры
         PUSH    DE
-        PUSH    HL
+        PUSH    BC
         CALL    InByte
-        POP     HL
-        POP     DE
         POP     BC
-        LD      (InCur),A
-        LD      A,8
-        LD      (InBitsLeft),A
+        POP     DE
+        POP     HL
+        LD      D,A
+        LD      E,8
 .have:
-        LD      HL,InBitsLeft
-        DEC     (HL)
-        LD      A,(InCur)
-        RLCA                                ; CF = старший бит
+        LD      A,E                         ; k = min(n, InBitsLeft) -> C
+        CP      B
+        JR      NC,.kn
+        LD      C,A
+        JR      .dok
+.kn:
+        LD      C,B
+.dok:
+        LD      A,C                         ; внести k бит: верхний бит InCur -> младший BitBuf
+.sh:
+        SLA     D
+        ADC     HL,HL
+        DEC     A
+        JR      NZ,.sh
+        LD      A,E                         ; InBitsLeft -= k
+        SUB     C
+        LD      E,A
+        LD      A,B                         ; n -= k
+        SUB     C
+        LD      B,A
+        JR      NZ,.loop
+        LD      (BitBuf),HL                 ; сохранить состояние
+        LD      A,D
         LD      (InCur),A
+        LD      A,E
+        LD      (InBitsLeft),A
         RET
 
 InByte:                                     ; -> A = очередной сжатый байт (0 если конец)

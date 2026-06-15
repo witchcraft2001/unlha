@@ -815,11 +815,21 @@ ExtractEntry:
         JR      NC,.stored
         CALL    IsLh5
         JR      NC,.lh5
+        CALL    IsLh1
+        JR      NC,.lh1
         ; неподдержанный метод — не создаём файл
         LD      HL,NameBuf
         CALL    PrintName
         LD      HL,MsgUnsup
         JP      PrintString
+.lh1:
+        CALL    EnsurePages
+        JR      C,.noMem
+        CALL    OpenOutForEntry
+        RET     C
+        CALL    DecodeLh1
+        CALL    CloseOutput
+        JP      VerifyCrc
 .stored:
         CALL    OpenOutForEntry             ; CF=1 -> пропуск
         RET     C
@@ -867,6 +877,12 @@ OpenOutForEntry:
 IsLh5:
         LD      HL,HdrBuf+2
         LD      DE,MethodLh5
+        JP      Cmp5
+
+; Метод -lh1-? CF=0 если да.
+IsLh1:
+        LD      HL,HdrBuf+2
+        LD      DE,MethodLh1
         JP      Cmp5
 
 ; Метод «без сжатия»? CF=0 для -lh0-/-lz4-.
@@ -1020,32 +1036,120 @@ PrintName:
         LD      HL,MsgGap
         JP      PrintString
 
-; OutBase = OutOrListPath, с завершающим '\' если непусто.
+; OutBase = абсолютный выходной каталог с завершающим '\'.
+;   нет аргумента        -> текущий каталог ("X:\curdir\")
+;   относительный путь    -> "X:\curdir\" + путь + '\'
+;   "X:..."/"\..."        -> приводится к абсолютному (диск/корень)
+; Абсолютный путь обязателен: DSS-операции с относительным путём нестабильны
+; (один файл мог попасть в X:\test, другой — в подкаталог текущего каталога).
 PrepareOutBase:
         LD      HL,OutOrListPath
-        LD      DE,OutBase
-        CALL    CopyStr
-        LD      A,(OutBase)
-        OR      A
-        RET     Z
-        LD      HL,OutBase
-.find:
         LD      A,(HL)
         OR      A
-        JR      Z,.atEnd
+        JR      Z,.default                  ; нет out_dir -> текущий каталог
+        LD      DE,OutBase
+        CALL    CopyStr
+        LD      HL,OutBase
+        CALL    AddBackSlash
+        LD      HL,OutBase
+        JP      MakePathAbsolute
+.default:
+        LD      HL,OutBase
+        JP      GetCurDir
+
+; HL -> ASCIIZ путь. Гарантирует завершающий '\'. Возврат: HL -> терминатор 0.
+; Вход не должен быть пустым (DEC HL ниже).
+AddBackSlash:
+        XOR     A
+.find:
+        CP      (HL)
+        JR      Z,.end
         INC     HL
         JR      .find
-.atEnd:
+.end:
         DEC     HL
         LD      A,(HL)
         CP      '\'
-        RET     Z
+        JR      Z,.sep
         CP      '/'
-        RET     Z
+        JR      Z,.sep
         INC     HL
         LD      (HL),'\'
+.sep:
         INC     HL
         LD      (HL),0
+        RET
+
+; Записать в HL абсолютный текущий каталог "X:\...\" (с завершающим '\').
+; Возврат: HL -> терминатор 0. CurDisk должен сохранять HL (как в DSS).
+GetCurDir:
+        PUSH    HL
+        LD      C,Dss.CurDisk
+        RST     Dss.Rst                     ; A = id диска (best-effort)
+        ADD     A,'A'
+        LD      (HL),A
+        INC     HL
+        LD      (HL),':'
+        INC     HL
+        LD      C,Dss.CurDir                ; пишет путь каталога после "X:"
+        RST     Dss.Rst
+        POP     HL
+        JP      AddBackSlash
+
+; Привести путь в HL к абсолютному (на месте). Использует TempPath как буфер.
+;   "X:..." -> без изменений; "\..." -> "X:\..."; иначе -> "X:\curdir\..."
+MakePathAbsolute:
+        LD      A,(HL)
+        OR      A
+        RET     Z                           ; пусто
+        INC     HL
+        LD      A,(HL)
+        DEC     HL
+        CP      ':'
+        RET     Z                           ; "X:..." уже абсолютный
+        PUSH    HL                          ; сохранить оригинал в TempPath
+        LD      DE,TempPath
+.save:
+        LD      A,(HL)
+        LD      (DE),A
+        INC     HL
+        INC     DE
+        OR      A
+        JR      NZ,.save
+        POP     HL
+        LD      A,(HL)
+        CP      '\'
+        JR      Z,.rootabs
+        CP      '/'
+        JR      Z,.rootabs
+        CALL    GetCurDir                   ; HL = OutBase -> "X:\curdir\", HL->терминатор
+        LD      DE,TempPath                 ; дописать оригинал
+.append:
+        LD      A,(DE)
+        LD      (HL),A
+        INC     HL
+        INC     DE
+        OR      A
+        JR      NZ,.append
+        RET
+.rootabs:
+        PUSH    HL                          ; путь "\...": подставить только "X:"
+        LD      C,Dss.CurDisk
+        RST     Dss.Rst
+        ADD     A,'A'
+        POP     HL
+        LD      (HL),A
+        INC     HL
+        LD      (HL),':'
+        INC     HL
+        LD      DE,TempPath
+.rapp:
+        LD      A,(DE)
+        LD      (HL),A
+        INC     HL
+        INC     DE
+        OR      A
+        JR      NZ,.rapp
         RET
 
 ; Создать все каталоги пути OutBase (best-effort, ошибки игнорируются).
@@ -1231,6 +1335,7 @@ CloseListFile:
         RET
 
         INCLUDE "lh5.asm"
+        INCLUDE "lh1.asm"
 
 ; ====================================================================
 ; Сообщения
@@ -1264,6 +1369,8 @@ MethodLz4:
         DB      "-lz4-"
 MethodLh5:
         DB      "-lh5-"
+MethodLh1:
+        DB      "-lh1-"
 MsgOpenErr:
         DB      "Error: cannot open archive", 13, 10, 0
 MsgCreateErr:
@@ -1317,8 +1424,9 @@ OutOrListPath:  DS      128
 MaskBuf:        DS      130
 HdrBuf:         DS      24
 NameBuf:        DS      256
-OutBase:        DS      132
-OutPath:        DS      160
+OutBase:        DS      256
+TempPath:       DS      256
+OutPath:        DS      320
 CopyBuf:        DS      CopyBufLen
 
         END

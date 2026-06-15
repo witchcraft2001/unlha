@@ -28,6 +28,8 @@ ListPageLines   EQU 22                  ; строк на экран перед 
 Start:
         LD      SP,UnlhaStack
         LD      (CommandLinePtr),IX
+        XOR     A
+        LD      (ExitCode),A
 
         LD      HL,MsgBanner
         CALL    PrintString
@@ -49,11 +51,10 @@ Start:
         OR      A
         JR      NZ,DoList
 
-        ; Режим распаковки пока не реализован (этап 2).
-        LD      HL,MsgExtractTodo
-        CALL    PrintString
+        ; Режим распаковки (этап 2: -lh0- / -lz4-, прочие методы — позже).
+        CALL    ExtractArchive
         CALL    CloseArchive
-        XOR     A
+        LD      A,(ExitCode)
         JP      ExitWithCodeA
 
 DoList:
@@ -593,6 +594,502 @@ NormChar:                                   ; A -> нормализованны�
         RET
 
 ; ====================================================================
+; РАСПАКОВКА (этап 2: stored -lh0-/-lz4-).
+; Использует абсолютную навигацию по записям (Move_FP FromStart).
+; ====================================================================
+ExtractArchive:
+        LD      HL,0                        ; RecordStart = 0
+        LD      (RecordStart),HL
+        LD      (RecordStart+2),HL
+        CALL    PrepareOutBase
+.loop:
+        CALL    SeekToRecord
+        JP      C,.done
+        LD      HL,HdrBuf                   ; фиксированная часть (22 байта)
+        LD      DE,22
+        LD      A,(ArcHandle)
+        LD      C,Dss.Read
+        RST     Dss.Rst
+        JP      C,.done
+        LD      A,E
+        CP      22
+        JP      C,.done
+        LD      A,(HdrBuf)
+        OR      A
+        JP      Z,.done
+        LD      A,(HdrBuf+#14)              ; уровень заголовка
+        CP      2
+        JR      C,.levelOk                  ; 0/1 поддержаны
+        LD      HL,MsgUnsupLevel            ; 2/3 — этап 6
+        CALL    PrintString
+        JP      .done
+.levelOk:
+        LD      A,(HdrBuf+#15)              ; длина имени
+        LD      (NameLen),A
+        OR      A
+        JR      Z,.noName
+        LD      E,A
+        LD      D,0
+        LD      HL,NameBuf
+        LD      A,(ArcHandle)
+        LD      C,Dss.Read
+        RST     Dss.Rst
+        JP      C,.done
+.noName:
+        LD      A,(NameLen)                 ; null-терминатор имени
+        LD      L,A
+        LD      H,0
+        LD      DE,NameBuf
+        ADD     HL,DE
+        LD      (HL),0
+
+        LD      HL,ExpectedCrc              ; CRC16 из заголовка (2 байта)
+        LD      DE,2
+        LD      A,(ArcHandle)
+        LD      C,Dss.Read
+        RST     Dss.Rst
+        JP      C,.done
+
+        CALL    ComputeNextRecord
+        CALL    WalkToData                  ; файл -> начало сжатых данных
+        JP      C,.done
+
+        CALL    EntrySelected               ; CF=1 -> пропустить запись
+        JR      C,.advance
+        CALL    ExtractEntry
+.advance:
+        LD      HL,(NextRecord)             ; RecordStart = NextRecord
+        LD      (RecordStart),HL
+        LD      HL,(NextRecord+2)
+        LD      (RecordStart+2),HL
+        JP      .loop
+.done:
+        RET
+
+; Перемотка к RecordStart (FromStart). CF=1 при ошибке.
+SeekToRecord:
+        LD      HL,(RecordStart+2)          ; старшее слово
+        LD      IX,(RecordStart)            ; младшее слово
+        LD      BC,#0015                    ; B=00 FromStart, C=15 Move_FP
+        LD      A,(ArcHandle)
+        RST     Dss.Rst
+        RET
+
+; NextRecord = RecordStart + (2 + headerSize) + packedField
+ComputeNextRecord:
+        LD      HL,(RecordStart)
+        LD      (NextRecord),HL
+        LD      HL,(RecordStart+2)
+        LD      (NextRecord+2),HL
+        LD      A,(HdrBuf)                  ; + (headerSize + 2)
+        LD      L,A
+        LD      H,0
+        INC     HL
+        INC     HL
+        LD      A,(NextRecord)
+        ADD     A,L
+        LD      (NextRecord),A
+        LD      A,(NextRecord+1)
+        ADC     A,H
+        LD      (NextRecord+1),A
+        LD      A,(NextRecord+2)
+        ADC     A,0
+        LD      (NextRecord+2),A
+        LD      A,(NextRecord+3)
+        ADC     A,0
+        LD      (NextRecord+3),A
+        LD      A,(HdrBuf+7)                ; + packedField (4 байта)
+        LD      B,A
+        LD      A,(NextRecord)
+        ADD     A,B
+        LD      (NextRecord),A
+        LD      A,(HdrBuf+8)
+        LD      B,A
+        LD      A,(NextRecord+1)
+        ADC     A,B
+        LD      (NextRecord+1),A
+        LD      A,(HdrBuf+9)
+        LD      B,A
+        LD      A,(NextRecord+2)
+        ADC     A,B
+        LD      (NextRecord+2),A
+        LD      A,(HdrBuf+#0A)
+        LD      B,A
+        LD      A,(NextRecord+3)
+        ADC     A,B
+        LD      (NextRecord+3),A
+        RET
+
+; Дойти от позиции после CRC16 до начала сжатых данных.
+; Level 0: пропустить ext-область. Level 1: пройти цепочку ext-заголовков.
+; CF=1 при ошибке ввода-вывода.
+WalkToData:
+        LD      A,(HdrBuf+#14)              ; уровень заголовка
+        OR      A
+        JR      Z,.level0
+        CP      1
+        JR      Z,.level1
+        OR      A                           ; уровень 2/3 не поддержан — данные
+        RET                                 ; всё равно пропустим запись по NextRecord
+.level0:
+        LD      A,(HdrBuf)                  ; skip = hs - 22 - nameLen
+        SUB     22
+        LD      B,A
+        LD      A,(NameLen)
+        LD      C,A
+        LD      A,B
+        SUB     C
+        LD      L,A
+        LD      H,0
+        JP      SkipFwd16
+.level1:
+        LD      A,(HdrBuf)                  ; skip = hs - 24 - nameLen (OS id + ext area)
+        SUB     24
+        LD      B,A
+        LD      A,(NameLen)
+        LD      C,A
+        LD      A,B
+        SUB     C
+        LD      L,A
+        LD      H,0
+        CALL    SkipFwd16
+        RET     C
+.extLoop:
+        LD      HL,ExtSize                  ; прочитать слово «размер ext-заголовка»
+        LD      DE,2
+        LD      A,(ArcHandle)
+        LD      C,Dss.Read
+        RST     Dss.Rst
+        RET     C
+        LD      HL,(ExtSize)
+        LD      A,H
+        OR      L
+        RET     Z                           ; 0 -> данные начинаются здесь
+        DEC     HL                          ; пропустить (ExtSize - 2) байт тела
+        DEC     HL
+        CALL    SkipFwd16
+        RET     C
+        JR      .extLoop
+
+; Перемотка вперёд на HL байт (FromCurrent). CF=1 при ошибке.
+SkipFwd16:
+        LD      A,H
+        OR      L
+        RET     Z                           ; ноль — ничего не делаем (CF=0)
+        PUSH    HL
+        POP     IX                          ; IX = младшее слово
+        LD      HL,0                        ; старшее слово
+        LD      BC,#0115                    ; FromCurrent
+        LD      A,(ArcHandle)
+        RST     Dss.Rst
+        RET
+
+; Выбрана ли запись для распаковки. CF=1 -> пропустить.
+EntrySelected:
+        CALL    IsDirEntry                  ; CF=0 -> это каталог (-lhd-), пропустить
+        JR      C,.notDir
+        SCF
+        RET
+.notDir:
+        LD      A,(MaskBuf)
+        OR      A
+        JR      Z,.sel
+        LD      HL,NameBuf
+        LD      DE,MaskBuf
+        CALL    MatchMask                   ; нет совпадения -> CF=1
+        RET     C
+.sel:
+        OR      A
+        RET
+
+IsDirEntry:                                 ; CF=0 если метод "-lhd-", иначе CF=1
+        LD      HL,HdrBuf+2
+        LD      DE,MethodDir
+        JP      Cmp5
+
+; Распаковать текущую запись (файл стоит на начале данных).
+ExtractEntry:
+        CALL    IsStored
+        JR      C,.unsup
+        CALL    BuildOutPath
+        CALL    CheckExisting               ; CF=1 -> пропуск
+        RET     C
+        LD      HL,OutPath
+        LD      A,FileAttrib.Arch
+        LD      C,Dss.Create
+        RST     Dss.Rst
+        JR      C,.createErr
+        LD      (OutHandle),A
+        CALL    ExtractStored
+        CALL    CloseOutput
+        JP      VerifyCrc
+.unsup:
+        LD      HL,NameBuf
+        CALL    PrintName
+        LD      HL,MsgUnsup
+        JP      PrintString
+.createErr:
+        LD      HL,NameBuf
+        CALL    PrintName
+        LD      HL,MsgCreateErr2
+        CALL    PrintString
+        LD      A,7
+        JP      SetExitCode
+
+; Метод «без сжатия»? CF=0 для -lh0-/-lz4-.
+IsStored:
+        LD      HL,HdrBuf+2
+        LD      DE,MethodLh0
+        CALL    Cmp5
+        RET     NC
+        LD      HL,HdrBuf+2
+        LD      DE,MethodLz4
+        JP      Cmp5
+
+; Сравнить 5 байт (HL vs DE). CF=0 если равны, CF=1 иначе.
+Cmp5:
+        LD      B,5
+.l:
+        LD      A,(DE)
+        CP      (HL)
+        JR      NZ,.no
+        INC     HL
+        INC     DE
+        DJNZ    .l
+        OR      A
+        RET
+.no:
+        SCF
+        RET
+
+; Копирование stored-данных вход->выход + CRC16. Размер = исходный (orig).
+ExtractStored:
+        LD      HL,(HdrBuf+#0B)
+        LD      (Remaining),HL
+        LD      HL,(HdrBuf+#0D)
+        LD      (Remaining+2),HL
+        LD      HL,0
+        LD      (Crc16),HL
+.loop:
+        CALL    ComputeChunk                ; DE = ChunkLen
+        LD      A,D
+        OR      E
+        RET     Z
+        PUSH    DE
+        LD      HL,CopyBuf                  ; читать ChunkLen из архива
+        LD      A,(ArcHandle)
+        LD      C,Dss.Read
+        RST     Dss.Rst
+        POP     BC
+        RET     C
+        PUSH    BC                          ; CRC по прочитанному блоку
+        LD      HL,CopyBuf
+        CALL    Crc16Update
+        POP     BC
+        LD      H,B                         ; записать ChunkLen в выход
+        LD      L,C
+        EX      DE,HL                       ; DE = ChunkLen
+        LD      HL,CopyBuf
+        LD      A,(OutHandle)
+        LD      C,Dss.Write
+        RST     Dss.Rst
+        RET     C
+        CALL    SubChunk                    ; Remaining -= ChunkLen
+        JR      .loop
+
+; ChunkLen = min(Remaining, размер CopyBuf). Результат в DE и (ChunkLen).
+ComputeChunk:
+        LD      A,(Remaining+2)
+        LD      B,A
+        LD      A,(Remaining+3)
+        OR      B
+        JR      NZ,.full
+        LD      A,(Remaining+1)
+        CP      high(CopyBufLen)
+        JR      NC,.full                    ; >= CopyBufLen
+        LD      DE,(Remaining)
+        JR      .store
+.full:
+        LD      DE,CopyBufLen
+.store:
+        LD      (ChunkLen),DE
+        RET
+
+SubChunk:                                   ; Remaining -= ChunkLen
+        LD      HL,(ChunkLen)
+        LD      A,(Remaining)
+        SUB     L
+        LD      (Remaining),A
+        LD      A,(Remaining+1)
+        SBC     A,H
+        LD      (Remaining+1),A
+        LD      A,(Remaining+2)
+        SBC     A,0
+        LD      (Remaining+2),A
+        LD      A,(Remaining+3)
+        SBC     A,0
+        LD      (Remaining+3),A
+        RET
+
+; CRC-16/ARC (poly 0xA001, init 0). HL=буфер, BC=кол-во. Обновляет (Crc16).
+Crc16Update:
+        LD      A,B
+        OR      C
+        RET     Z
+        LD      DE,(Crc16)
+.next:
+        LD      A,(HL)
+        XOR     E
+        LD      E,A
+        PUSH    BC
+        LD      B,8
+.bit:
+        SRL     D
+        RR      E
+        JR      NC,.noXor
+        LD      A,D
+        XOR     #A0
+        LD      D,A
+        LD      A,E
+        XOR     #01
+        LD      E,A
+.noXor:
+        DJNZ    .bit
+        POP     BC
+        INC     HL
+        DEC     BC
+        LD      A,B
+        OR      C
+        JR      NZ,.next
+        LD      (Crc16),DE
+        RET
+
+; Сверка CRC16, печать результата, код возврата.
+VerifyCrc:
+        LD      HL,NameBuf
+        CALL    PrintName
+        LD      HL,(Crc16)
+        LD      DE,(ExpectedCrc)
+        OR      A
+        SBC     HL,DE
+        JR      NZ,.bad
+        LD      HL,MsgOk
+        JP      PrintString
+.bad:
+        LD      HL,MsgBadCrc
+        CALL    PrintString
+        LD      A,#17
+        JP      SetExitCode
+
+; Печать имени записи + разделитель.
+PrintName:
+        CALL    PrintString
+        LD      HL,MsgGap
+        JP      PrintString
+
+; OutBase = OutOrListPath, с завершающим '\' если непусто.
+PrepareOutBase:
+        LD      HL,OutOrListPath
+        LD      DE,OutBase
+        CALL    CopyStr
+        LD      A,(OutBase)
+        OR      A
+        RET     Z
+        LD      HL,OutBase
+.find:
+        LD      A,(HL)
+        OR      A
+        JR      Z,.atEnd
+        INC     HL
+        JR      .find
+.atEnd:
+        DEC     HL
+        LD      A,(HL)
+        CP      '\'
+        RET     Z
+        CP      '/'
+        RET     Z
+        INC     HL
+        LD      (HL),'\'
+        INC     HL
+        LD      (HL),0
+        RET
+
+; OutPath = OutBase + NameBuf
+BuildOutPath:
+        LD      HL,OutBase
+        LD      DE,OutPath
+        CALL    CopyNoTerm
+        LD      HL,NameBuf
+.l:
+        LD      A,(HL)
+        LD      (DE),A
+        OR      A
+        RET     Z
+        INC     HL
+        INC     DE
+        JR      .l
+
+CopyNoTerm:                                 ; HL->DE до нуля (ноль не копируется)
+        LD      A,(HL)
+        OR      A
+        RET     Z
+        LD      (DE),A
+        INC     HL
+        INC     DE
+        JR      CopyNoTerm
+
+; Проверка существующего файла. CF=1 -> пропустить запись.
+CheckExisting:
+        LD      A,(OverwriteMode)
+        CP      1
+        JR      Z,.ok                       ; -o: перезаписывать
+        LD      HL,OutPath
+        LD      A,FileMode.Read
+        LD      C,Dss.Open
+        RST     Dss.Rst
+        JR      C,.ok                       ; не открылся -> не существует
+        LD      C,Dss.Close                 ; существует -> закрыть дескриптор
+        RST     Dss.Rst
+        LD      HL,NameBuf
+        CALL    PrintName
+        LD      HL,MsgExists
+        CALL    PrintString
+        LD      A,(OverwriteMode)
+        CP      2
+        JR      Z,.skip                     ; -s: тихо пропустить
+        LD      A,7
+        CALL    SetExitCode
+.skip:
+        SCF
+        RET
+.ok:
+        OR      A
+        RET
+
+CloseOutput:
+        LD      A,(OutHandle)
+        LD      C,Dss.Close
+        RST     Dss.Rst
+        RET
+
+SetExitCode:                                ; A=код, хранится первый ненулевой
+        PUSH    HL
+        PUSH    AF
+        LD      HL,ExitCode
+        LD      A,(HL)
+        OR      A
+        JR      NZ,.keep
+        POP     AF
+        LD      (HL),A
+        POP     HL
+        RET
+.keep:
+        POP     AF
+        POP     HL
+        RET
+
+; ====================================================================
 ; Утилиты со строками
 ; ====================================================================
 CopyStr:                                    ; HL -> DE (ASCIIZ)
@@ -680,8 +1177,24 @@ MsgUsage:
         DB      " unlha.exe <archive.lzh> [<out_dir>] [<mask>]", 13, 10
         DB      " unlha.exe -l <archive.lzh> [<list_file>] [<mask>]", 13, 10
         DB      "Options: -l list  -o overwrite  -s skip  -x strip", 13, 10, 0
-MsgExtractTodo:
-        DB      "Extraction will be added in stage 2. Use -l to list.", 13, 10, 0
+MsgUnsup:
+        DB      "skip (method not supported yet)", 13, 10, 0
+MsgOk:
+        DB      "OK", 13, 10, 0
+MsgBadCrc:
+        DB      "CRC ERROR", 13, 10, 0
+MsgExists:
+        DB      "exists", 13, 10, 0
+MsgUnsupLevel:
+        DB      "header level 2/3 not supported yet", 13, 10, 0
+MsgCreateErr2:
+        DB      "cannot create", 13, 10, 0
+MethodDir:
+        DB      "-lhd-"
+MethodLh0:
+        DB      "-lh0-"
+MethodLz4:
+        DB      "-lz4-"
 MsgOpenErr:
         DB      "Error: cannot open archive", 13, 10, 0
 MsgCreateErr:
@@ -696,10 +1209,14 @@ MsgCrLf:
 ; ====================================================================
 ; Переменные / буферы (RAM в WIN1, инициализируются образом EXE)
 ; ====================================================================
+CopyBufLen      EQU     2048
+
 CommandLinePtr: DW      0
 ArcHandle:      DB      0
+OutHandle:      DB      0
 ListFileHandle: DB      #FF
 ListResult:     DB      0
+ExitCode:       DB      0
 ModeList:       DB      0
 OverwriteMode:  DB      0
 StripMode:      DB      0
@@ -716,11 +1233,22 @@ NumWork:        DS      4
 NumStr:         DS      12
 MethodStr:      DS      6
 
+RecordStart:    DS      4
+NextRecord:     DS      4
+Remaining:      DS      4
+ExpectedCrc:    DS      2
+ExtSize:        DS      2
+ChunkLen:       DS      2
+Crc16:          DS      2
+
 ParamBuf:       DS      128
 ArchivePath:    DS      128
 OutOrListPath:  DS      128
 MaskBuf:        DS      130
 HdrBuf:         DS      24
 NameBuf:        DS      256
+OutBase:        DS      132
+OutPath:        DS      160
+CopyBuf:        DS      CopyBufLen
 
         END

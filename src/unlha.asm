@@ -51,8 +51,9 @@ Start:
         OR      A
         JR      NZ,DoList
 
-        ; Режим распаковки (этап 2: -lh0- / -lz4-, прочие методы — позже).
+        ; Режим распаковки (-lh0-/-lz4- stored, -lh5- AR002).
         CALL    ExtractArchive
+        CALL    FreePages
         CALL    CloseArchive
         LD      A,(ExitCode)
         JP      ExitWithCodeA
@@ -602,6 +603,7 @@ ExtractArchive:
         LD      (RecordStart),HL
         LD      (RecordStart+2),HL
         CALL    PrepareOutBase
+        CALL    EnsureOutDir                ; создать выходной каталог при необходимости
 .loop:
         CALL    SeekToRecord
         JP      C,.done
@@ -810,7 +812,36 @@ IsDirEntry:                                 ; CF=0 если метод "-lhd-", 
 ; Распаковать текущую запись (файл стоит на начале данных).
 ExtractEntry:
         CALL    IsStored
-        JR      C,.unsup
+        JR      NC,.stored
+        CALL    IsLh5
+        JR      NC,.lh5
+        ; неподдержанный метод — не создаём файл
+        LD      HL,NameBuf
+        CALL    PrintName
+        LD      HL,MsgUnsup
+        JP      PrintString
+.stored:
+        CALL    OpenOutForEntry             ; CF=1 -> пропуск
+        RET     C
+        CALL    ExtractStored
+        CALL    CloseOutput
+        JP      VerifyCrc
+.lh5:
+        CALL    EnsurePages
+        JR      C,.noMem
+        CALL    OpenOutForEntry
+        RET     C
+        CALL    DecodeLh5
+        CALL    CloseOutput
+        JP      VerifyCrc
+.noMem:
+        LD      HL,NameBuf
+        CALL    PrintName
+        LD      HL,MsgNoMem
+        JP      PrintString
+
+; Построить путь, проверить существующий, создать файл. CF=1 -> пропуск.
+OpenOutForEntry:
         CALL    BuildOutPath
         CALL    CheckExisting               ; CF=1 -> пропуск
         RET     C
@@ -818,23 +849,25 @@ ExtractEntry:
         LD      A,FileAttrib.Arch
         LD      C,Dss.Create
         RST     Dss.Rst
-        JR      C,.createErr
+        JR      C,.err
         LD      (OutHandle),A
-        CALL    ExtractStored
-        CALL    CloseOutput
-        JP      VerifyCrc
-.unsup:
-        LD      HL,NameBuf
-        CALL    PrintName
-        LD      HL,MsgUnsup
-        JP      PrintString
-.createErr:
+        OR      A
+        RET
+.err:
         LD      HL,NameBuf
         CALL    PrintName
         LD      HL,MsgCreateErr2
         CALL    PrintString
         LD      A,7
-        JP      SetExitCode
+        CALL    SetExitCode
+        SCF
+        RET
+
+; Метод -lh5-? CF=0 если да.
+IsLh5:
+        LD      HL,HdrBuf+2
+        LD      DE,MethodLh5
+        JP      Cmp5
 
 ; Метод «без сжатия»? CF=0 для -lh0-/-lz4-.
 IsStored:
@@ -1015,6 +1048,36 @@ PrepareOutBase:
         LD      (HL),0
         RET
 
+; Создать все каталоги пути OutBase (best-effort, ошибки игнорируются).
+; Для каждого разделителя '\'/'/'  делаем MkDir префикса.
+EnsureOutDir:
+        LD      HL,OutBase
+        LD      A,(HL)
+        OR      A
+        RET     Z                           ; пусто -> текущий каталог
+.scan:
+        LD      A,(HL)
+        OR      A
+        RET     Z
+        CP      '\'
+        JR      Z,.mk
+        CP      '/'
+        JR      Z,.mk
+        INC     HL
+        JR      .scan
+.mk:
+        LD      (SaveSep),A                 ; сохранить разделитель
+        LD      (HL),0                      ; временно завершить строку
+        PUSH    HL
+        LD      HL,OutBase
+        LD      C,Dss.MkDir
+        RST     Dss.Rst                     ; ошибки (уже существует) игнорируем
+        POP     HL
+        LD      A,(SaveSep)
+        LD      (HL),A                      ; восстановить разделитель
+        INC     HL
+        JR      .scan
+
 ; OutPath = OutBase + NameBuf
 BuildOutPath:
         LD      HL,OutBase
@@ -1167,6 +1230,8 @@ CloseListFile:
         RST     Dss.Rst
         RET
 
+        INCLUDE "lh5.asm"
+
 ; ====================================================================
 ; Сообщения
 ; ====================================================================
@@ -1187,6 +1252,8 @@ MsgExists:
         DB      "exists", 13, 10, 0
 MsgUnsupLevel:
         DB      "header level 2/3 not supported yet", 13, 10, 0
+MsgNoMem:
+        DB      "no memory for decode", 13, 10, 0
 MsgCreateErr2:
         DB      "cannot create", 13, 10, 0
 MethodDir:
@@ -1195,6 +1262,8 @@ MethodLh0:
         DB      "-lh0-"
 MethodLz4:
         DB      "-lz4-"
+MethodLh5:
+        DB      "-lh5-"
 MsgOpenErr:
         DB      "Error: cannot open archive", 13, 10, 0
 MsgCreateErr:
@@ -1223,6 +1292,7 @@ StripMode:      DB      0
 PosCount:       DB      0
 NameLen:        DB      0
 LineCount:      DB      0
+SaveSep:        DB      0
 
 MmStar:         DB      0
 MmStarP:        DW      0

@@ -993,9 +993,11 @@ Crc16Update:
         LD      A,(CacheHeld)               ; кэш уже держится декодером?
         OR      A
         JP      NZ,CacheCrc16Update         ; да -> прямой вызов (без Enter/Restore)
-        CALL    EnterCacheWindow
+        CALL    EnterCacheWindow            ; вне декода: DI/CASH_ON ...
         CALL    CacheCrc16Update            ; SRAM #3A00
-        JP      RestoreSystemWindow         ; tail (делает EI), RET вызвавшему
+        CALL    RestoreSystemWindow         ; ... CASH_OFF (без EI)
+        EI                                  ; вернуть обычный поток DSS (EI)
+        RET
 
 ; Сверка CRC16, печать результата, код возврата.
 VerifyCrc:

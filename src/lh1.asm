@@ -1,6 +1,12 @@
 ; ====================================================================
 ;   Декодер -lh1- (LZHUF): LZSS + адаптивный Хаффман, окно 4 КБ.
 ;   Порт проверенного Python-эталона (LZHUF.C). Этап 4.
+;   Этап 5C: вычислительное ядро (DecodeChar/Update/UpdateSwap/Reconst/
+;   DecodePosition/GetWord/PutWord) вынесено в SRAM WIN0 (DISP-бандл
+;   #2200) — выборка кода без wait-состояний. Ядро не делает DSS, поэтому
+;   ловушки «возврат в SRAM после выключения кэша» нет. Главный цикл,
+;   копирование совпадений, Lh1PutByte/Lh1Flush (с DSS-трамплинами) и
+;   StartHuff остаются в DRAM (WIN1) и зовут SRAM-ядро при CASH_ON.
 ; ====================================================================
 ; Использует из lh5.asm: GetFilePos, CalcCompRemaining, InitBitReader,
 ; GetBits, RemainingZero, MapDataPages; из unlha.asm: Crc16Update.
@@ -16,11 +22,12 @@ LH1_MAXFREQ     EQU #8000
 ; Рабочие массивы lh1 — в SRAM WIN0 (этап 5B): декод держит CASH_ON, поэтому
 ; обращения к дереву идут без wait-состояний. Выходной буфер остаётся в WIN3
 ; (#C000), т.к. сбрасывается через DSS (вне кэша). Раскладка не пересекается
-; с CRC-таблицей (#3800) — проверяется ASSERT в cache.asm.
+; с кодом-ядром (#2200) и CRC-таблицей (#3800) — проверяется ASSERT в cache.asm.
 TextBufBase     EQU #0000           ; окно 4096 байт (SRAM)
 FreqBase        EQU #1000           ; freq[T+1] слов  (628*2 -> #1000-#14E7)
 SonBase         EQU #1500           ; son[T] слов      (627*2 -> #1500-#19E5)
 PrntBase        EQU #1A00           ; prnt[T+NCHAR] слов (941*2 -> #1A00-#2179)
+SramLh1Code     EQU #2200           ; SRAM-бандл ядра декодера (этап 5C)
 Lh1OutBuf       EQU #C000           ; выходной буфер 4096 (WIN3, не кэш)
 Lh1OutBufLen    EQU 4096
 
@@ -38,9 +45,9 @@ DecodeLh1:
         LD      HL,0
         LD      (Crc16),HL
         LD      (Lh1OutPos),HL
-        ; --- войти в кэш и держать CASH_ON весь декод (массивы дерева в SRAM).
-        ; DSS-init выше (GetFilePos/InitBitReader) сделан вне кэша. Дальше DSS
-        ; только на границах RefillInBuf/Lh1Flush — они трамплинятся по CacheHeld.
+        ; --- войти в кэш и держать CASH_ON весь декод (массивы дерева + ядро
+        ; в SRAM). DSS-init выше (GetFilePos/InitBitReader) сделан вне кэша.
+        ; Дальше DSS только на границах RefillInBuf/Lh1Flush — трамплины по CacheHeld.
         LD      A,1
         LD      (CacheHeld),A
         CALL    EnterCacheWindow
@@ -49,7 +56,7 @@ DecodeLh1:
 .loop:
         CALL    RemainingZero
         JR      Z,.done
-        CALL    DecodeChar                  ; HL = c
+        CALL    DecodeChar                  ; HL = c (ядро в SRAM)
         LD      A,H
         OR      A
         JR      NZ,.match                   ; c >= 256
@@ -61,7 +68,7 @@ DecodeLh1:
         OR      A
         SBC     HL,DE
         LD      (Lh1Len),HL
-        CALL    DecodePosition              ; HL = pos
+        CALL    DecodePosition              ; HL = pos (ядро в SRAM)
         EX      DE,HL                       ; DE = pos
         LD      HL,(Lh1R)                   ; i = (r - pos - 1) & (N-1)
         OR      A
@@ -97,12 +104,13 @@ DecodeLh1:
         JR      .copy
 .done:
         CALL    Lh1Flush                    ; сброс остатка (трамплинит DSS-запись)
-        CALL    RestoreSystemWindow         ; выйти из кэша (делает EI)
+        CALL    RestoreSystemWindow         ; выйти из кэша (CASH_OFF, без EI)
+        EI                                  ; вернуть обычный поток DSS (EI)
         XOR     A
         LD      (CacheHeld),A
         RET
 
-; Окно: text_buf[0..N-F-1] = ' '(0x20), r = N-F.
+; Окно: text_buf[0..N-F-1] = ' '(0x20), r = N-F.  (DRAM; пишет SRAM TextBuf)
 Lh1InitWindow:
         LD      HL,TextBufBase
         LD      (HL),#20
@@ -114,7 +122,7 @@ Lh1InitWindow:
         RET
 
 ; ====================================================================
-; Вывод байта: в окно + в выходной буфер (с flush), Remaining--.
+; Вывод байта: в окно + в выходной буфер (с flush), Remaining--.  (DRAM)
 ; ====================================================================
 Lh1PutByte:
         PUSH    AF
@@ -163,6 +171,7 @@ Lh1PutByte:
         LD      (HL),A
         RET
 
+; DRAM: CRC через SRAM-процедуру (кэш держится), DSS-запись — вне кэша.
 Lh1Flush:
         LD      HL,(Lh1OutPos)
         LD      A,H
@@ -171,7 +180,7 @@ Lh1Flush:
         LD      BC,(Lh1OutPos)
         LD      HL,Lh1OutBuf
         CALL    Crc16Update                 ; cache-aware (прямой CacheCrc16 в кэше)
-        ; --- DSS-запись: вне кэша, если он держится (CacheHeld) ---
+        ; --- DSS-запись на границе: Restore->DSS->Enter, БЕЗ EI (DI весь декод) ---
         LD      A,(CacheHeld)
         OR      A
         CALL    NZ,RestoreSystemWindow
@@ -187,27 +196,7 @@ Lh1Flush:
         RET
 
 ; ====================================================================
-; Доступ к словным массивам: HL=индекс, DE=база.
-; ====================================================================
-Lh1GetWord:                                 ; -> HL = word[index]; сохраняет DE
-        ADD     HL,HL
-        ADD     HL,DE
-        LD      A,(HL)
-        INC     HL
-        LD      H,(HL)
-        LD      L,A
-        RET
-
-Lh1PutWord:                                 ; HL=index, DE=база, BC=значение
-        ADD     HL,HL
-        ADD     HL,DE
-        LD      (HL),C
-        INC     HL
-        LD      (HL),B
-        RET
-
-; ====================================================================
-; StartHuff — инициализация дерева.
+; StartHuff — инициализация дерева. (DRAM; зовёт SRAM GetWord/PutWord при CASH_ON)
 ; ====================================================================
 StartHuff:
         ; freq[0..NCHAR-1] = 1
@@ -308,6 +297,33 @@ StartHuff:
         LD      DE,PrntBase
         LD      BC,0
         CALL    Lh1PutWord
+        RET
+
+; ====================================================================
+; SRAM-бандл ядра декодера (этап 5C). Хранится в EXE, копируется в
+; SramLh1Code на старте (InitSramBundle), исполняется только при CASH_ON.
+; Метки внутри ассемблируются под адреса SRAM; out-вызовы (GetBits) и
+; данные (Lh1Cv/.../Lh1DCode/Lh1DLen) — по абсолютным адресам WIN1.
+; ====================================================================
+Lh1CacheStored:
+        DISP    SramLh1Code
+
+; Доступ к словным массивам: HL=индекс, DE=база.
+Lh1GetWord:                                 ; -> HL = word[index]; сохраняет DE
+        ADD     HL,HL
+        ADD     HL,DE
+        LD      A,(HL)
+        INC     HL
+        LD      H,(HL)
+        LD      L,A
+        RET
+
+Lh1PutWord:                                 ; HL=index, DE=база, BC=значение
+        ADD     HL,HL
+        ADD     HL,DE
+        LD      (HL),C
+        INC     HL
+        LD      (HL),B
         RET
 
 ; ====================================================================
@@ -741,8 +757,13 @@ Lh1Reconst:
 .p3d:
         RET
 
+Lh1CacheRuntimeEnd:
+        ASSERT  Lh1GetWord == SramLh1Code
+        ENT
+Lh1CacheStoredEnd:
+
 ; ====================================================================
-; Статические таблицы позиций (в WIN1, читаются напрямую).
+; Статические таблицы позиций (в WIN1, читаются ядром по абсолютным адресам).
 ; ====================================================================
         INCLUDE "dtables.inc"
 

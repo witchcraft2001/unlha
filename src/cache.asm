@@ -39,12 +39,18 @@ SramPageEnd     EQU     #4000
 ; ====================================================================
 InitSramBundle:
         CALL    EnterCacheWindow
-        LD      HL,CacheCodeStored          ; байты бандла лежат в EXE (WIN1)
-        LD      DE,SramCacheCode            ; -> SRAM WIN0
+        LD      HL,CacheCodeStored          ; байты CRC-бандла лежат в EXE (WIN1)
+        LD      DE,SramCacheCode            ; -> SRAM WIN0 (#3A00)
         LD      BC,CacheCodeStoredEnd - CacheCodeStored
         LDIR
+        LD      HL,Lh1CacheStored           ; ядро декодера -lh1- (этап 5C)
+        LD      DE,SramLh1Code              ; -> SRAM WIN0 (#2200)
+        LD      BC,Lh1CacheStoredEnd - Lh1CacheStored
+        LDIR
         CALL    BuildCrc16Table             ; таблица CRC16 прямо в SRAM
-        JP      RestoreSystemWindow         ; tail (делает EI), RET вызвавшему
+        CALL    RestoreSystemWindow         ; CASH_OFF (без EI)
+        EI                                  ; вернуть обычный поток DSS (EI)
+        RET
 
 ; Построить таблицу CRC16/ARC (полином #A001) в SRAM, раздельно lo/hi.
 ; Вызывается при CASH_ON=1 (пишет в WIN0). Портит AF,BC,DE,HL.
@@ -76,8 +82,14 @@ BuildCrc16Table:
         RET
 
 ; ====================================================================
-; Вход/выход в SRAM-окно. Портит AF (BC сохраняется).
-; EnterCacheWindow делает DI; RestoreSystemWindow делает EI.
+; Вход/выход в SRAM-окно (модель sprinter-unzip). Портит AF (BC сохраняется).
+;   EnterCacheWindow      — CASH_ON + DI.
+;   RestoreSystemWindow   — CASH_OFF; прерывания НЕ трогает.
+; Декодер держит DI весь проход, включая DSS-границы (Restore->DSS->Enter):
+; прерывание в момент переключения карты памяти/кэша портит состояние. EI
+; выполняется ЯВНО вызывающим при возврате к обычному потоку DSS — на трёх
+; границах верхнего уровня: InitSramBundle, Crc16Update (вне кэша), конец
+; DecodeLh1. На DSS-границах внутри декода EI не делается (DI держится).
 ; ====================================================================
 EnterCacheWindow:
         PUSH    BC
@@ -91,7 +103,7 @@ EnterCacheWindow:
         POP     BC
         RET
 
-RestoreSystemWindow:
+RestoreSystemWindow:                        ; CASH_OFF; прерывания не трогаем
         PUSH    BC
         IN      A,(CacheOffPort)            ; CASH_ON = 0
         LD      A,SysMapDss
@@ -99,7 +111,6 @@ RestoreSystemWindow:
         LD      BC,ISA.System
         LD      A,IsaSystemDss
         OUT     (C),A                       ; ISA system <- 1
-        EI
         POP     BC
         RET
 
@@ -152,4 +163,5 @@ CacheCodeStoredEnd:
         ASSERT  FreqBase >= TextBufBase + LH1_N
         ASSERT  SonBase  >= FreqBase + (LH1_T+1)*2
         ASSERT  PrntBase >= SonBase + LH1_T*2
-        ASSERT  PrntBase + (LH1_T+LH1_NCHAR)*2 <= SramCrcTableLo
+        ASSERT  SramLh1Code >= PrntBase + (LH1_T+LH1_NCHAR)*2  ; ядро после массивов
+        ASSERT  Lh1CacheRuntimeEnd <= SramCrcTableLo           ; ядро до CRC-таблицы

@@ -325,7 +325,7 @@ RefillInBuf:                                ; CF=1 если данных бол�
         JR      Z,.none
         CALL    CompInChunk                 ; BC = min(CompRemaining, InBufLen)
         PUSH    BC
-        ; --- DSS-чтение: вне кэша, если он держится декодером (CacheHeld) ---
+        ; --- DSS-чтение на границе: Restore->DSS->Enter, БЕЗ EI (DI весь декод) ---
         LD      A,(CacheHeld)
         OR      A
         CALL    NZ,RestoreSystemWindow

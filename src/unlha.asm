@@ -18,6 +18,7 @@ ExeVersion      EQU 1
 ListPageLines   EQU 22                  ; строк на экран перед паузой
 KbCtrlMask      EQU #2A                 ; KB_CTRL|KB_L_CTRL|KB_R_CTRL (Ctrl зажат)
 ScanCodeC       EQU #AC                 ; scancode 'C' (для Ctrl+C)
+ExtDirMax       EQU 132                 ; буфер каталога из ext-заголовка
 
         ORG     UnlhaOrg - DSS_EXE_HEADER_SIZE
         DSS_EXE_HEADER ExeVersion, #0000, UnlhaOrg, UnlhaOrg, UnlhaStack
@@ -1061,6 +1062,8 @@ ComputeNextRecord:
 ; Level 0: пропустить ext-область. Level 1: пройти цепочку ext-заголовков.
 ; CF=1 при ошибке ввода-вывода.
 WalkToData:
+        XOR     A
+        LD      (ExtDir),A                  ; нет каталога из ext-заголовка по умолчанию
         LD      A,(HdrBuf+#14)              ; уровень заголовка
         OR      A
         JR      Z,.level0
@@ -1102,9 +1105,45 @@ WalkToData:
         LD      A,H
         OR      L
         RET     Z                           ; 0 -> данные начинаются здесь
-        DEC     HL                          ; пропустить (ExtSize - 2) байт тела
+        PUSH    HL                          ; сохранить ExtSize; прочитать байт типа
+        LD      HL,ExtType
+        LD      DE,1
+        LD      A,(ArcHandle)
+        LD      C,Dss.Read
+        RST     Dss.Rst
+        POP     HL                          ; HL = ExtSize
+        RET     C
+        DEC     HL                          ; тело после size+type = ExtSize-3 байт
         DEC     HL
-        CALL    SkipFwd16
+        DEC     HL
+        LD      A,(ExtType)
+        CP      2                           ; 0x02 = имя каталога
+        JR      Z,.dir
+        CALL    SkipFwd16                   ; иначе пропустить тело
+        RET     C
+        JR      .extLoop
+.dir:
+        LD      A,H                         ; >255 или >= буфера -> не влезает, пропуск
+        OR      A
+        JR      NZ,.dirBig
+        LD      A,L
+        CP      ExtDirMax
+        JR      NC,.dirBig
+        LD      E,L                         ; DE = длина тела
+        LD      D,0
+        PUSH    DE
+        LD      HL,ExtDir
+        LD      A,(ArcHandle)
+        LD      C,Dss.Read
+        RST     Dss.Rst
+        POP     DE
+        RET     C
+        LD      HL,ExtDir                   ; завершить нулём
+        ADD     HL,DE
+        LD      (HL),0
+        JR      .extLoop
+.dirBig:
+        CALL    SkipFwd16                   ; HL = ExtSize-3, пропустить тело целиком
         RET     C
         JR      .extLoop
 
@@ -1188,8 +1227,36 @@ ExtractEntry:
         JP      PrintString
 
 ; Построить путь, проверить существующий, создать файл. CF=1 -> пропуск.
+; Создать все каталоги-префиксы OutPath (best-effort). Имя файла (после посл. '\')
+; не трогается. MkDir на существующих каталогах игнорируется.
+EnsurePathDirs:
+        LD      HL,OutPath
+.scan:
+        LD      A,(HL)
+        OR      A
+        RET     Z                           ; конец строки (имя файла без '\' далее)
+        CP      '\'
+        JR      Z,.mk
+        CP      '/'
+        JR      Z,.mk
+        INC     HL
+        JR      .scan
+.mk:
+        LD      (SaveSep),A
+        LD      (HL),0                      ; временно завершить префикс
+        PUSH    HL
+        LD      HL,OutPath
+        LD      C,Dss.MkDir
+        RST     Dss.Rst                     ; ошибки (уже существует) игнорируем
+        POP     HL
+        LD      A,(SaveSep)
+        LD      (HL),A                      ; восстановить разделитель
+        INC     HL
+        JR      .scan
+
 OpenOutForEntry:
         CALL    BuildOutPath
+        CALL    EnsurePathDirs              ; создать подкаталоги пути (из ext-заголовка)
         CALL    CheckExisting               ; CF=1 -> пропуск
         RET     C
         LD      HL,OutPath
@@ -1507,7 +1574,13 @@ EnsureOutDir:
 BuildOutPath:
         LD      HL,OutBase
         LD      DE,OutPath
-        CALL    CopyNoTerm
+        CALL    CopyNoTerm                  ; OutPath = OutBase (DE -> конец)
+        LD      A,(ExtDir)                  ; каталог из ext-заголовка?
+        OR      A
+        JR      Z,.name
+        LD      HL,ExtDir
+        CALL    AppendDir                   ; дописать каталог (0xFF->\, норм., трейлинг \)
+.name:
         LD      HL,NameBuf
 .l:
         LD      A,(HL)
@@ -1517,6 +1590,49 @@ BuildOutPath:
         INC     HL
         INC     DE
         JR      .l
+
+; Дописать ExtDir (0xFF-разделённый) в (DE): 0xFF/'/'->'\', нормализация символов,
+; каждый компонент <=8, гарантированный завершающий '\'. HL=ExtDir, DE=dest.
+AppendDir:
+        LD      B,0                         ; длина текущего компонента
+.l:
+        LD      A,(HL)
+        OR      A
+        JR      Z,.done
+        CP      #FF
+        JR      Z,.sep
+        CP      '/'
+        JR      Z,.sep
+        CP      '\'
+        JR      Z,.sep
+        LD      A,B                         ; >=8 символов в компоненте -> пропуск
+        CP      8
+        JR      NC,.skip
+        LD      A,(HL)
+        CALL    Norm83Char
+        LD      (DE),A
+        INC     DE
+        INC     B
+.skip:
+        INC     HL
+        JR      .l
+.sep:
+        LD      A,'\'
+        LD      (DE),A
+        INC     DE
+        LD      B,0
+        INC     HL
+        JR      .l
+.done:
+        DEC     DE                          ; уже есть завершающий '\'?
+        LD      A,(DE)
+        INC     DE
+        CP      '\'
+        RET     Z
+        LD      A,'\'
+        LD      (DE),A
+        INC     DE
+        RET
 
 CopyNoTerm:                                 ; HL->DE до нуля (ноль не копируется)
         LD      A,(HL)
@@ -1836,6 +1952,8 @@ StripPrefix:    DS      132         ; -x: срезаемый префикс ка
 StripPrefixLen: DB      0
 Norm83:         DS      14          ; 8.3-имя: 8 + '.' + 3 + 0
 NormDot:        DW      0           ; указатель на последнюю '.' в имени
+ExtType:        DB      0           ; тип текущего ext-заголовка
+ExtDir:         DS      ExtDirMax   ; каталог из ext-заголовка type 0x02 (0xFF-разд.)
 
 RecordStart:    DS      4
 NextRecord:     DS      4

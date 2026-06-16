@@ -1277,53 +1277,7 @@ ShrHL_E:                                    ; HL >>= E (логический)
         RR      L
         JR      .l
 
-; ====================================================================
-; Переменные декодера (WIN1).
-; ====================================================================
-BitBuf:         DW      0
-InCur:          DB      0
-InBitsLeft:     DB      0
-InPos:          DW      0
-InCnt:          DW      0
-CompRemaining:  DS      4
-RingPos:        DW      0
-BlockSize:      DW      0
-DataStart:      DS      4
+; Переменные/буферы декодера lh5 вынесены в BSS-блок в конце unlha.asm
+; (BitBuf, InCur, ..., InBufBase) — чтобы их нули не попадали в EXE-файл.
 ; MatchLen/MatchDist больше не нужны: len держится в стеке через DecodeP,
 ; дистанция — в регистре (EX DE,HL).
-MatchSrc:       DW      0
-PagesReady:     DB      0
-MemBlock:       DB      0
-PhysPage2:      DB      0
-PhysPage3:      DB      0
-PageTable:      DS      8
-PtThresh:       DW      0
-PtNbit:         DB      0
-PtISpec:        DB      0
-PtCount:        DW      0
-PtI:            DW      0
-PtZ:            DB      0
-CCount:         DW      0
-CI:             DW      0
-CRun:           DW      0
-MtNchar:        DW      0
-MtTBits:        DB      0
-MtJut:          DB      0
-MtBitlen:       DW      0
-MtTable:        DW      0
-MtLeft:         DW      0
-MtRight:        DW      0
-MtAvail:        DW      0
-MtMask:         DW      0
-MtCh:           DW      0
-MtLen:          DB      0
-MtK:            DW      0
-MtNext:         DW      0
-MtP:            DW      0
-MtKW:           DW      0
-MtTreeI:        DB      0
-MtKK:           DW      0
-MtCount:        DS      34
-MtStart:        DS      36
-MtWeight:       DS      34
-InBufBase:      DS      InBufLen

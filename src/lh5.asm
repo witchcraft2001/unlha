@@ -669,11 +669,11 @@ ReadPtLen:
         LD      A,H
         OR      L
         JR      NZ,.nonzero
-        LD      A,(PtNbit)                  ; n==0: c=getbits(nbit)
+        CALL    ZeroPtLen                   ; обнулить pt_len ДО чтения c
+        LD      A,(PtNbit)                  ; (ZeroPtLen портит HL, биты не трогает)
         LD      B,A
-        CALL    GetBits
-        CALL    ZeroPtLen
-        CALL    FillPtTableConst            ; pt_table = c (HL)
+        CALL    GetBits                     ; n==0: c=getbits(nbit) -> HL
+        CALL    FillPtTableConst            ; pt_table = c (HL не испорчен)
         RET
 .nonzero:
         LD      (PtCount),HL
@@ -761,10 +761,10 @@ ReadCLen:
         LD      A,H
         OR      L
         JR      NZ,.nonzero
-        LD      B,LH5_CBIT                  ; n==0: c=getbits(CBIT)
+        CALL    ZeroCLen                    ; обнулить c_len ДО чтения c (портит HL)
+        LD      B,LH5_CBIT                  ; n==0: c=getbits(CBIT) -> HL
         CALL    GetBits
-        CALL    ZeroCLen
-        CALL    FillCTableConst             ; c_table = c
+        CALL    FillCTableConst             ; c_table = c (HL не испорчен)
         RET
 .nonzero:
         LD      (CCount),HL

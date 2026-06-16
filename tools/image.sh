@@ -31,6 +31,17 @@ if [ -d "$repo_root/test" ]; then
     upper="$(printf '%s' "$base" | tr 'a-z' 'A-Z')"
     mcopy -i "$image_path" -o "$f" "::$upper"
   done
+  # .lha — короткое 8.3-имя (длинные имена не влезают в FAT 8.3)
+  for f in "$repo_root"/test/*.lha "$repo_root"/test/*.LHA; do
+    [ -f "$f" ] || continue
+    stem="$(basename "$f")"; stem="${stem%.*}"
+    short="$(printf '%s' "$stem" | tr 'a-z' 'A-Z' | tr -cd 'A-Z0-9' | cut -c1-8)"
+    if mcopy -i "$image_path" -o "$f" "::$short.LHA" 2>/dev/null; then
+      echo "  $(basename "$f") -> $short.LHA"
+    else
+      echo "  $(basename "$f") -> $short.LHA  (ПРОПУЩЕН: дискета полна)"
+    fi
+  done
 fi
 
 echo "Created FAT12 image: $image_path"

@@ -507,11 +507,11 @@ DecodeP:                                    ; -> HL = p (дистанция-1)
         LD      D,(HL)
         EX      DE,HL                       ; HL = j
         LD      DE,(PtThresh)
-        PUSH    HL
-        OR      A
-        SBC     HL,DE
-        POP     HL
-        JR      C,.leaf
+        LD      A,L                         ; j < PtThresh ? (через A, без порчи HL)
+        SUB     E
+        LD      A,H
+        SBC     A,D
+        JR      C,.leaf                     ; j < thresh -> leaf
         LD      C,#80                       ; mask = 1<<(15-8)
 .walk:
         LD      A,(BitBuf)
@@ -537,11 +537,11 @@ DecodeP:                                    ; -> HL = p (дистанция-1)
         SRL     C
         JR      Z,.leaf                     ; предохранитель от зацикливания
         LD      DE,(PtThresh)
-        PUSH    HL
-        OR      A
-        SBC     HL,DE
-        POP     HL
-        JR      NC,.walk
+        LD      A,L                         ; j >= PtThresh ? (через A, без порчи HL)
+        SUB     E
+        LD      A,H
+        SBC     A,D
+        JR      NC,.walk                    ; j >= thresh -> продолжить обход
 .leaf:
         PUSH    HL                          ; fillbuf(pt_len[j])
         LD      DE,PtLenBase

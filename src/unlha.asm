@@ -988,6 +988,9 @@ ExtractArchive:
         CALL    EntrySelected               ; CF=1 -> пропустить запись
         JR      C,.advance
         CALL    ExtractEntry
+        LD      A,(AbortFlag)               ; запрос прерван (Esc в диалоге)?
+        OR      A
+        JP      NZ,.done
 .advance:
         LD      HL,(NextRecord)             ; RecordStart = NextRecord
         LD      (RecordStart),HL
@@ -1528,24 +1531,71 @@ CopyNoTerm:                                 ; HL->DE до нуля (ноль н�
 CheckExisting:
         LD      A,(OverwriteMode)
         CP      1
-        JR      Z,.ok                       ; -o: перезаписывать
-        LD      HL,OutPath
+        JP      Z,.ok                       ; -o: перезаписывать без вопроса
+        LD      HL,OutPath                  ; файл существует?
         LD      A,FileMode.Read
         LD      C,Dss.Open
         RST     Dss.Rst
-        JR      C,.ok                       ; не открылся -> не существует
-        LD      C,Dss.Close                 ; существует -> закрыть дескриптор
+        JP      C,.ok                       ; нет -> создавать
+        LD      C,Dss.Close                 ; есть -> закрыть дескриптор
         RST     Dss.Rst
+        LD      A,(OverwriteMode)
+        CP      2
+        JR      Z,.skipS                    ; -s: тихо пропустить
+        ; --- режим запроса: спросить пользователя ---
+        LD      HL,NameBuf
+        CALL    PrintName
+        LD      HL,MsgOverwriteQ
+        CALL    PrintString
+.ask:
+        LD      C,Dss.WaitKey
+        RST     Dss.Rst
+        CP      27                          ; Esc -> прервать
+        JR      Z,.abort
+        CP      3                           ; Ctrl+C -> прервать
+        JR      Z,.abort
+        OR      #20                         ; в нижний регистр (для букв)
+        CP      'y'
+        JR      Z,.over
+        CP      'a'
+        JR      Z,.allOver
+        CP      'n'
+        JR      Z,.noOver
+        CP      's'
+        JR      Z,.allSkip
+        JR      .ask                        ; иной ввод -> ждать снова
+.allOver:
+        LD      A,1                         ; перезаписывать всё дальше
+        LD      (OverwriteMode),A
+.over:
+        LD      HL,MsgCrLf
+        CALL    PrintString
+        JR      .ok                         ; CF=0 -> создать (Dss.Create перезапишет)
+.allSkip:
+        LD      A,2                         ; пропускать всё дальше
+        LD      (OverwriteMode),A
+.noOver:
+        LD      HL,MsgCrLf
+        CALL    PrintString
+        LD      A,7
+        CALL    SetExitCode
+        SCF
+        RET
+.skipS:                                     ; -s: показать имя + exists, пропустить
         LD      HL,NameBuf
         CALL    PrintName
         LD      HL,MsgExists
         CALL    PrintString
-        LD      A,(OverwriteMode)
-        CP      2
-        JR      Z,.skip                     ; -s: тихо пропустить
         LD      A,7
         CALL    SetExitCode
-.skip:
+        SCF
+        RET
+.abort:
+        LD      HL,MsgCrLf
+        CALL    PrintString
+        LD      A,1
+        LD      (AbortFlag),A               ; остановить распаковку
+        CALL    AbortMsg
         SCF
         RET
 .ok:
@@ -1718,6 +1768,8 @@ MsgBadCrc:
         DB      "CRC ERROR", 13, 10, 0
 MsgExists:
         DB      "exists", 13, 10, 0
+MsgOverwriteQ:
+        DB      " exists. Overwrite? y/n, a=all, s=skip ", 0
 MsgUnsupLevel:
         DB      "header level 2/3 not supported yet", 13, 10, 0
 MsgNoMem:
@@ -1765,6 +1817,7 @@ ExitCode:       DB      0
 ModeList:       DB      0
 OverwriteMode:  DB      0
 StripMode:      DB      0
+AbortFlag:      DB      0           ; 1 = прервать распаковку (Esc/Ctrl+C в запросе)
 PosCount:       DB      0
 NameLen:        DB      0
 LineCount:      DB      0

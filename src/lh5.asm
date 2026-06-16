@@ -139,17 +139,15 @@ RemainingZero:                              ; Z=1, если Remaining==0
         RET
 
 ; Вывести байт A в окно/выход; flush при заполнении; Remaining--.
+; Портит AF,C,DE,HL (BC тоже). Вызывающие не полагаются на сохранность регистров:
+; литерал перезагружает всё, match-copy сам сохраняет счётчик (PUSH/POP BC). Байт
+; держим в C — прежние PUSH/POP HL/DE/BC/AF (4 пары на байт) были избыточны.
 OutByteCount:
-        PUSH    HL
-        PUSH    DE
-        PUSH    BC
-        PUSH    AF
-        LD      HL,(RingPos)
+        LD      C,A                         ; байт
+        LD      HL,(RingPos)                ; ring[r] = byte
         LD      DE,RingBufBase
         ADD     HL,DE
-        POP     AF
-        PUSH    AF
-        LD      (HL),A
+        LD      (HL),C
         LD      HL,(RingPos)
         INC     HL
         LD      (RingPos),HL
@@ -160,10 +158,6 @@ OutByteCount:
         LD      HL,0
         LD      (RingPos),HL
 .noflush:
-        POP     AF
-        POP     BC
-        POP     DE
-        POP     HL
         ; Remaining--
         LD      HL,Remaining
         LD      A,(HL)

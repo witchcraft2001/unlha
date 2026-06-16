@@ -82,57 +82,8 @@ DecodeLh1:
         LD      (Lh1OutPos),HL
         CALL    Lh1InitWindow               ; пишет SRAM TextBuf (CASH_ON)
         CALL    StartHuff                   ; пишет SRAM freq/son/prnt (CASH_ON)
-.loop:
-        CALL    RemainingZero
-        JR      Z,.done
-        CALL    DecodeChar                  ; HL = c (ядро в SRAM)
-        LD      A,H
-        OR      A
-        JR      NZ,.match                   ; c >= 256
-        LD      A,L
-        CALL    Lh1PutByte
-        JR      .loop
-.match:
-        LD      DE,255-LH1_THRESH           ; len = c - 255 + THRESHOLD = c-253
-        OR      A
-        SBC     HL,DE
-        LD      (Lh1Len),HL
-        CALL    DecodePosition              ; HL = pos (ядро в SRAM)
-        EX      DE,HL                       ; DE = pos
-        LD      HL,(Lh1R)                   ; i = (r - pos - 1) & (N-1)
-        OR      A
-        SBC     HL,DE
-        DEC     HL
-        LD      A,H
-        AND     #0F
-        LD      H,A
-        LD      (Lh1MatchI),HL
-        LD      BC,(Lh1Len)
-.copy:
-        LD      A,B
-        OR      C
-        JR      Z,.loop
-        PUSH    BC
-        LD      HL,(Lh1MatchI)
-        LD      DE,TextBufBase
-        ADD     HL,DE
-        LD      A,(HL)
-        LD      E,A
-        LD      HL,(Lh1MatchI)
-        INC     HL
-        LD      A,H
-        AND     #0F
-        LD      H,A
-        LD      (Lh1MatchI),HL
-        LD      A,E
-        CALL    Lh1PutByte
-        POP     BC
-        DEC     BC
-        CALL    RemainingZero
-        JR      Z,.done
-        JR      .copy
-.done:
-        CALL    Lh1Flush                    ; сброс остатка (трамплинит DSS-запись)
+        CALL    CacheLh1Loop                ; основной цикл декода — в SRAM
+        CALL    Lh1Flush                    ; финальный сброс (трамплинит DSS-запись)
         CALL    RestoreSystemWindow         ; выйти из кэша (CASH_OFF, без EI)
         EI                                  ; вернуть обычный поток DSS (EI)
         XOR     A
@@ -150,55 +101,7 @@ Lh1InitWindow:
         LD      (Lh1R),HL
         RET
 
-; ====================================================================
-; Вывод байта: в окно + в выходной буфер (с flush), Remaining--.  (DRAM)
-; ====================================================================
-Lh1PutByte:
-        PUSH    AF
-        LD      HL,(Lh1R)                   ; text_buf[r] = A
-        LD      DE,TextBufBase
-        ADD     HL,DE
-        POP     AF
-        PUSH    AF
-        LD      (HL),A
-        LD      HL,(Lh1R)                   ; r = (r+1) & (N-1)
-        INC     HL
-        LD      A,H
-        AND     #0F
-        LD      H,A
-        LD      (Lh1R),HL
-        LD      HL,(Lh1OutPos)              ; out_buf[outpos] = A
-        LD      DE,Lh1OutBuf
-        ADD     HL,DE
-        POP     AF
-        LD      (HL),A
-        LD      HL,(Lh1OutPos)
-        INC     HL
-        LD      (Lh1OutPos),HL
-        LD      A,H
-        CP      high(Lh1OutBufLen)          ; буфер полон (4096) ?
-        JR      NZ,.nf
-        CALL    Lh1Flush
-        LD      HL,0
-        LD      (Lh1OutPos),HL
-.nf:
-        LD      HL,Remaining                ; Remaining--
-        LD      A,(HL)
-        SUB     1
-        LD      (HL),A
-        INC     HL
-        LD      A,(HL)
-        SBC     A,0
-        LD      (HL),A
-        INC     HL
-        LD      A,(HL)
-        SBC     A,0
-        LD      (HL),A
-        INC     HL
-        LD      A,(HL)
-        SBC     A,0
-        LD      (HL),A
-        RET
+; Lh1PutByte перенесён в SRAM-бандл (этап 5O: горячий — на каждый выходной байт).
 
 ; DRAM: CRC через SRAM-процедуру (кэш держится), DSS-запись — вне кэша.
 Lh1Flush:
@@ -206,14 +109,16 @@ Lh1Flush:
         LD      A,H
         OR      L
         RET     Z
-        LD      BC,(Lh1OutPos)
-        LD      HL,Lh1OutBuf
+        LD      BC,(Lh1OutPos)              ; число байт (Lh1OutPos в SRAM, CASH_ON)
+        PUSH    BC                          ; сохранить: CRC портит BC, а после
+        LD      HL,Lh1OutBuf                ; RestoreSystemWindow SRAM недоступен
         CALL    Crc16Update                 ; cache-aware (прямой CacheCrc16 в кэше)
-        ; --- DSS-запись на границе: Restore->DSS->Enter, БЕЗ EI (DI весь декод) ---
+        POP     DE                          ; DE = число байт (из регистра, не из SRAM!)
+        ; --- DSS-запись на границе: Restore->DSS->Enter, БЕЗ EI (DI весь декод).
+        ; Lh1OutPos лежит в SRAM и при CASH_OFF недоступен — счётчик уже в DE.
         LD      A,(CacheHeld)
         OR      A
         CALL    NZ,RestoreSystemWindow
-        LD      DE,(Lh1OutPos)
         LD      HL,Lh1OutBuf
         LD      A,(OutHandle)
         LD      C,Dss.Write
@@ -369,7 +274,7 @@ DecodeChar:
         JR      NC,.leaf                    ; c >= T
         PUSH    HL                          ; c = son[c + bit]
         LD      B,1
-        CALL    GetBits
+        CALL    CacheGetBits                ; SRAM-битридер
         LD      A,L
         POP     HL
         ADD     A,L
@@ -400,7 +305,7 @@ DecodeChar:
 ; ====================================================================
 DecodePosition:
         LD      B,8
-        CALL    GetBits                     ; i = байт
+        CALL    CacheGetBits                ; i = байт (SRAM-битридер)
         LD      A,L
         LD      (Lh1I8),A
         LD      H,0                          ; c = d_code[i] << 6
@@ -439,7 +344,7 @@ DecodePosition:
         ADD     HL,HL
         LD      (Lh1Pos),HL
         LD      B,1
-        CALL    GetBits                     ; bit
+        CALL    CacheGetBits                ; bit (SRAM-битридер)
         LD      A,L
         OR      A
         JR      Z,.lp
@@ -858,6 +763,215 @@ Lh1Reconst:
         JR      .p3
 .p3d:
         RET
+
+; ====================================================================
+; SRAM-копии битридера для lh1 (этап 5O-2 р2): чтобы DecodeChar/DecodePosition
+; не платили DRAM-выборку кода на каждый бит. Состояние (BitBuf/InCur/
+; InBitsLeft/InPos/InCnt) и InBuf — общие в WIN1, доступны при CASH_ON.
+; Дозагрузка входа -> DRAM RefillInBuf (трамплин, ре-вход в кэш перед RET).
+; Тела идентичны GetBits/FillBuf/InByte из lh5.asm (взаимные вызовы — на SRAM).
+; ====================================================================
+CacheGetBits:
+        LD      A,B
+        OR      A
+        JR      NZ,.nz
+        LD      HL,0
+        RET
+.nz:
+        LD      HL,(BitBuf)
+        LD      DE,0
+        LD      A,B
+.ex:
+        ADD     HL,HL
+        RL      E
+        RL      D
+        DEC     A
+        JR      NZ,.ex
+        PUSH    DE
+        CALL    CacheFillBuf
+        POP     HL
+        RET
+
+CacheFillBuf:
+        LD      A,B
+        OR      A
+        RET     Z
+        LD      HL,(BitBuf)
+        LD      A,(InCur)
+        LD      D,A
+        LD      A,(InBitsLeft)
+        LD      E,A
+.loop:
+        LD      A,E
+        OR      A
+        JR      NZ,.have
+        PUSH    HL
+        PUSH    DE
+        PUSH    BC
+        CALL    CacheInByte
+        POP     BC
+        POP     DE
+        POP     HL
+        LD      D,A
+        LD      E,8
+.have:
+        LD      A,E
+        CP      B
+        JR      NC,.kn
+        LD      C,A
+        JR      .dok
+.kn:
+        LD      C,B
+.dok:
+        LD      A,C
+.sh:
+        SLA     D
+        ADC     HL,HL
+        DEC     A
+        JR      NZ,.sh
+        LD      A,E
+        SUB     C
+        LD      E,A
+        LD      A,B
+        SUB     C
+        LD      B,A
+        JR      NZ,.loop
+        LD      (BitBuf),HL
+        LD      A,D
+        LD      (InCur),A
+        LD      A,E
+        LD      (InBitsLeft),A
+        RET
+
+CacheInByte:
+        LD      HL,(InPos)
+        LD      DE,(InCnt)
+        OR      A
+        SBC     HL,DE
+        JR      C,.get
+        CALL    RefillInBuf                 ; DRAM-трамплин (ре-вход в кэш перед RET)
+        JR      C,.zero
+.get:
+        LD      HL,(InPos)
+        LD      DE,InBufBase
+        ADD     HL,DE
+        LD      A,(HL)
+        LD      HL,(InPos)
+        INC     HL
+        LD      (InPos),HL
+        RET
+.zero:
+        XOR     A
+        RET
+
+; Вывод байта (SRAM, этап 5O): окно + выходной буфер (с flush), Remaining--.
+; Байт держим в C (без PUSH/POP AF). text_buf[r] пишем по адресу r напрямую
+; (TextBufBase=#0000 -> ADD не нужен). Flush сбрасывает Lh1OutPos уже при CASH_ON
+; (после возврата из DRAM Lh1Flush). Remaining — в DRAM. Портит AF,C,DE,HL.
+        ASSERT  TextBufBase == 0            ; для прямой записи text_buf[r]
+Lh1PutByte:
+        LD      C,A                         ; байт
+        LD      HL,(Lh1R)                   ; text_buf[r] = byte (адрес = r)
+        LD      (HL),C
+        INC     HL                          ; r = (r+1) & (N-1)
+        LD      A,H
+        AND     #0F
+        LD      H,A
+        LD      (Lh1R),HL
+        LD      HL,(Lh1OutPos)              ; out_buf[outpos] = byte
+        LD      DE,Lh1OutBuf
+        ADD     HL,DE
+        LD      (HL),C
+        LD      HL,(Lh1OutPos)
+        INC     HL
+        LD      (Lh1OutPos),HL
+        LD      A,H
+        CP      high(Lh1OutBufLen)          ; буфер полон (4096) ?
+        JR      NZ,.nf
+        CALL    Lh1Flush                    ; DRAM (трамплин), возврат при CASH_ON
+        LD      HL,0
+        LD      (Lh1OutPos),HL              ; CASH_ON -> запись SRAM-переменной OK
+.nf:
+        LD      HL,Remaining                ; Remaining-- (32-бит, DRAM)
+        LD      A,(HL)
+        SUB     1
+        LD      (HL),A
+        INC     HL
+        LD      A,(HL)
+        SBC     A,0
+        LD      (HL),A
+        INC     HL
+        LD      A,(HL)
+        SBC     A,0
+        LD      (HL),A
+        INC     HL
+        LD      A,(HL)
+        SBC     A,0
+        LD      (HL),A
+        RET
+
+; RemainingZero (SRAM-копия): Z=1 если Remaining(DRAM)==0.
+CacheRemainingZero:
+        LD      A,(Remaining)
+        LD      HL,Remaining+1
+        OR      (HL)
+        INC     HL
+        OR      (HL)
+        INC     HL
+        OR      (HL)
+        RET
+
+; Основной цикл декода -lh1- (SRAM, этап 5O р2). Вызывается из DecodeLh1 после
+; Enter (CASH_ON держится); возврат, когда Remaining==0. Поцикловая работа и
+; копирование совпадений идут из SRAM. text_buf[matchI] читается по адресу=index
+; (TextBufBase=#0000), без перезагрузки Lh1MatchI (адрес уже = индекс).
+CacheLh1Loop:
+.loop:
+        CALL    CacheRemainingZero
+        RET     Z
+        CALL    DecodeChar                  ; HL = c
+        LD      A,H
+        OR      A
+        JR      NZ,.match                   ; c >= 256
+        LD      A,L
+        CALL    Lh1PutByte
+        JR      .loop
+.match:
+        LD      DE,255-LH1_THRESH           ; len = c - 255 + THRESHOLD = c-253
+        OR      A
+        SBC     HL,DE
+        LD      (Lh1Len),HL
+        CALL    DecodePosition              ; HL = pos
+        EX      DE,HL                       ; DE = pos
+        LD      HL,(Lh1R)                   ; i = (r - pos - 1) & (N-1)
+        OR      A
+        SBC     HL,DE
+        DEC     HL
+        LD      A,H
+        AND     #0F
+        LD      H,A
+        LD      (Lh1MatchI),HL
+        LD      BC,(Lh1Len)
+.copy:
+        LD      A,B
+        OR      C
+        JR      Z,.loop
+        PUSH    BC
+        LD      HL,(Lh1MatchI)              ; b = text_buf[matchI] (адрес = index)
+        LD      A,(HL)
+        LD      E,A
+        INC     HL                          ; matchI = (matchI+1) & (N-1)
+        LD      A,H
+        AND     #0F
+        LD      H,A
+        LD      (Lh1MatchI),HL
+        LD      A,E
+        CALL    Lh1PutByte
+        POP     BC
+        DEC     BC
+        CALL    CacheRemainingZero
+        RET     Z
+        JR      .copy
 
 Lh1CacheRuntimeEnd:
         ASSERT  Lh1GetWord == SramLh1Code

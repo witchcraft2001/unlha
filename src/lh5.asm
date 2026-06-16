@@ -91,11 +91,10 @@ Lh5DecodeLoop:
         LD      DE,256-LH5_THRESHOLD         ; len = c - 256 + THRESHOLD = c - 253
         OR      A
         SBC     HL,DE
-        LD      (MatchLen),HL
+        PUSH    HL                          ; сохранить len через DecodeP (в стеке)
         CALL    DecodeP                     ; HL = p (дистанция-1)
-        LD      (MatchDist),HL
+        EX      DE,HL                       ; DE = p (без MatchDist в памяти)
         LD      HL,(RingPos)                ; src = (r - p - 1) & DICMASK
-        LD      DE,(MatchDist)
         OR      A
         SBC     HL,DE
         DEC     HL
@@ -103,7 +102,7 @@ Lh5DecodeLoop:
         AND     high(LH5_DICMASK)
         LD      H,A
         LD      (MatchSrc),HL
-        LD      BC,(MatchLen)
+        POP     BC                          ; BC = len
 .copy:
         LD      A,B
         OR      C
@@ -1286,8 +1285,8 @@ CompRemaining:  DS      4
 RingPos:        DW      0
 BlockSize:      DW      0
 DataStart:      DS      4
-MatchLen:       DW      0
-MatchDist:      DW      0
+; MatchLen/MatchDist больше не нужны: len держится в стеке через DecodeP,
+; дистанция — в регистре (EX DE,HL).
 MatchSrc:       DW      0
 PagesReady:     DB      0
 MemBlock:       DB      0

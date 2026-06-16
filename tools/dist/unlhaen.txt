@@ -1,0 +1,66 @@
+UNLHA 0.1 - LZH/LHA unpacker for Sprinter DSS
+Author: Dmitry Mikhalchenkov (SprinterTeam)
+
+DESCRIPTION
+  UNLHA unpacks LZH/LHA archives on Sprinter DSS. Supported compression
+  methods: -lh0-/-lz4- (stored), -lh5- (AR002), -lh1- (LZHUF). Header
+  levels 0 and 1, including Amiga archives (directories and long names).
+  Integrity is verified with CRC16/ARC over the uncompressed data.
+
+USAGE
+  unlha.exe <archive.lzh> [<out_dir>] [<mask>]        unpack
+  unlha.exe -l <archive.lzh> [<list_file>] [<mask>]   list (screen or file)
+  unlha.exe -o <archive.lzh> [<out_dir>] [<mask>]     overwrite existing
+  unlha.exe -s <archive.lzh> [<out_dir>] [<mask>]     skip existing
+  unlha.exe -x <archive.lzh> [<out_dir>] <mask>       strip mask dir prefix
+
+OPTIONS (prefix - or /, single letter)
+  -l  list archive contents (no extraction)
+  -o  overwrite existing files without asking
+  -s  skip existing files without asking
+  -x  strip the mask's directory prefix from names (a mask is required)
+
+OUTPUT DIRECTORY
+  Default is the current directory. A positional <out_dir> is made
+  absolute. If the second argument contains a wildcard it is treated as a
+  mask and output goes to the current directory. Subdirectories stored in
+  the archive are created automatically.
+
+MASKS
+  *  matches any sequence, ?  matches one character. Case-insensitive;
+  / and \ are equivalent. A mask ending in \ or / means "all files in
+  that directory".
+
+LISTING (-l)
+  Without <list_file> the listing is printed to the screen with a page
+  pause (Esc stops). With a file name it is written to a text file.
+  Columns: method, packed size, original size, date and time, name.
+
+OVERWRITE PROMPT
+  Without -o/-s, when a file already exists you are asked:
+    Overwrite? y/n, a=all, s=skip
+  y - overwrite this file, n - skip it, a - overwrite all,
+  s - skip all, Esc/Ctrl+C - abort.
+
+INTERRUPT
+  Esc or Ctrl+C aborts listing and extraction (prints "Aborted",
+  return code 1).
+
+RETURN CODES
+  0   success
+  1   bad command line, or interrupted (Esc/Ctrl+C)
+  3   archive not found
+  7   output file exists and was not replaced
+  13  damaged or unknown LZH format
+  23  CRC16 mismatch
+  other - the DSS error code is passed through
+
+NOTES
+  File names are converted to DOS 8.3 (base up to 8, extension up to 3);
+  characters not allowed in 8.3 become '_'. Methods -lh4-/-lh6-/-lh7-
+  and -lzs-/-lz5-, and header levels 2 and 3, are not supported.
+
+PACKAGE
+  unlha.exe    - the program
+  unlhaen.txt  - this file (English)
+  unlha.txt    - description in Russian (CP866)

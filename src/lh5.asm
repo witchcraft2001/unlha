@@ -223,20 +223,20 @@ GetBits:
         LD      HL,0
         RET
 .nz:
+        ; result = верхние B бит BitBuf. Извлекаем сдвигом ВЛЕВО за B итераций
+        ; (вместо 16-B вправо) — выгодно для частого B=1 (обход дерева: 1 vs 15).
         LD      HL,(BitBuf)
-        LD      A,16
-        SUB     B
-        JR      Z,.fill                     ; n==16 -> весь BitBuf
-        LD      E,A
-.sh:
-        SRL     H
-        RR      L
-        DEC     E
-        JR      NZ,.sh
-.fill:
-        PUSH    HL
-        CALL    FillBuf
-        POP     HL
+        LD      DE,0
+        LD      A,B
+.ex:
+        ADD     HL,HL                       ; bit15 -> CF
+        RL      E
+        RL      D
+        DEC     A
+        JR      NZ,.ex
+        PUSH    DE                          ; результат (B сохранён для FillBuf)
+        CALL    FillBuf                     ; продвинуть поток на B бит
+        POP     HL                          ; -> HL
         RET
 
 ; FillBuf(B=n): сдвинуть BitBuf влево на n, втянув n новых бит.

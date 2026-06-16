@@ -31,6 +31,34 @@ SramLh1Code     EQU #2200           ; SRAM-бандл ядра декодера 
 Lh1OutBuf       EQU #C000           ; выходной буфер 4096 (WIN3, не кэш)
 Lh1OutBufLen    EQU 4096
 
+; Рабочие переменные lh1 — в SRAM WIN0 (этап 5O-3): доступ без wait-состояний.
+; Все пишутся до чтения при CASH_ON (init Lh1OutPos перенесён после Enter), так
+; что неинициализированный SRAM безопасен. Адреса самовычисляемые (prev+размер).
+Lh1Vars         EQU #3000
+Lh1R            EQU Lh1Vars + 0
+Lh1OutPos       EQU Lh1R + 2
+Lh1Len          EQU Lh1OutPos + 2
+Lh1MatchI       EQU Lh1Len + 2
+Lh1I            EQU Lh1MatchI + 2
+Lh1J            EQU Lh1I + 2
+Lh1Cv           EQU Lh1J + 2
+Lh1K            EQU Lh1Cv + 2
+Lh1L            EQU Lh1K + 2
+Lh1Ti           EQU Lh1L + 2
+Lh1Tj           EQU Lh1Ti + 2
+Lh1Pos          EQU Lh1Tj + 2
+Lh1C            EQU Lh1Pos + 2
+Lh1I8           EQU Lh1C + 2
+Lh1JBits        EQU Lh1I8 + 1
+Lh1Ri           EQU Lh1JBits + 1
+Lh1Rj           EQU Lh1Ri + 2
+Lh1Rk           EQU Lh1Rj + 2
+Lh1Rf           EQU Lh1Rk + 2
+Lh1Rcnt         EQU Lh1Rf + 2
+Lh1Rsrc         EQU Lh1Rcnt + 2
+Lh1Tson         EQU Lh1Rsrc + 2
+Lh1VarsEnd      EQU Lh1Tson + 2
+
 ; ====================================================================
 DecodeLh1:
         CALL    GetFilePos
@@ -43,14 +71,15 @@ DecodeLh1:
         LD      HL,(HdrBuf+#0D)
         LD      (Remaining+2),HL
         LD      HL,0
-        LD      (Crc16),HL
-        LD      (Lh1OutPos),HL
+        LD      (Crc16),HL                  ; Crc16 — в DRAM (читается вне кэша)
         ; --- войти в кэш и держать CASH_ON весь декод (массивы дерева + ядро
-        ; в SRAM). DSS-init выше (GetFilePos/InitBitReader) сделан вне кэша.
-        ; Дальше DSS только на границах RefillInBuf/Lh1Flush — трамплины по CacheHeld.
+        ; + переменные lh1 в SRAM). DSS-init выше (GetFilePos/InitBitReader) сделан
+        ; вне кэша. Дальше DSS только на границах RefillInBuf/Lh1Flush (трамплины).
         LD      A,1
         LD      (CacheHeld),A
         CALL    EnterCacheWindow
+        LD      HL,0                        ; Lh1OutPos в SRAM -> init после Enter
+        LD      (Lh1OutPos),HL
         CALL    Lh1InitWindow               ; пишет SRAM TextBuf (CASH_ON)
         CALL    StartHuff                   ; пишет SRAM freq/son/prnt (CASH_ON)
 .loop:
@@ -330,9 +359,7 @@ Lh1PutWord:                                 ; HL=index, DE=база, BC=знач
 ; DecodeChar -> HL = c (0..NCHAR-1).
 ; ====================================================================
 DecodeChar:
-        LD      HL,LH1_R                    ; c = son[R]
-        LD      DE,SonBase
-        CALL    Lh1GetWord
+        LD      HL,(SonBase + LH1_R*2)      ; c = son[R] (R константа -> прямой адрес)
 .walk:
         LD      DE,LH1_T                    ; while c < T
         PUSH    HL
@@ -349,9 +376,14 @@ DecodeChar:
         LD      L,A
         LD      A,0
         ADC     A,H
-        LD      H,A
+        LD      H,A                         ; HL = c + bit
+        ADD     HL,HL                       ; son[c+bit] (инлайн Lh1GetWord)
         LD      DE,SonBase
-        CALL    Lh1GetWord
+        ADD     HL,DE
+        LD      A,(HL)
+        INC     HL
+        LD      H,(HL)
+        LD      L,A
         JR      .walk
 .leaf:
         LD      DE,LH1_T                    ; c -= T
@@ -429,60 +461,83 @@ DecodePosition:
 ; update(c) — частоты и реструктуризация.
 ; ====================================================================
 Lh1Update:
-        LD      HL,LH1_R                    ; if freq[R]==MAX_FREQ: reconst
-        LD      DE,FreqBase
-        CALL    Lh1GetWord
+        LD      HL,(FreqBase + LH1_R*2)     ; freq[R] (прямой адрес) == MAX_FREQ?
         LD      DE,LH1_MAXFREQ
         OR      A
         SBC     HL,DE
         JR      NZ,.nrec
         CALL    Lh1Reconst
 .nrec:
-        LD      HL,(Lh1Cv)                  ; c = prnt[c+T]
+        LD      HL,(Lh1Cv)                  ; c = prnt[c+T] (инлайн Lh1GetWord)
         LD      DE,LH1_T
         ADD     HL,DE
+        ADD     HL,HL
         LD      DE,PrntBase
-        CALL    Lh1GetWord
+        ADD     HL,DE
+        LD      A,(HL)
+        INC     HL
+        LD      H,(HL)
+        LD      L,A
         LD      (Lh1Cv),HL
 .uloop:
-        LD      HL,(Lh1Cv)                  ; k = ++freq[c]
+        ; freq[c]++ на месте; k = freq[c]; freq[l]=freq[c+1] по смежному адресу
+        LD      HL,(Lh1Cv)                  ; &freq[c]
+        ADD     HL,HL
         LD      DE,FreqBase
-        CALL    Lh1GetWord
+        ADD     HL,DE
+        INC     (HL)                        ; freq[c]++ (16 бит)
+        JR      NZ,.kinc
         INC     HL
-        LD      (Lh1K),HL
-        LD      B,H
-        LD      C,L
-        LD      HL,(Lh1Cv)
-        LD      DE,FreqBase
-        CALL    Lh1PutWord
-        LD      HL,(Lh1Cv)                  ; l = c+1
+        INC     (HL)
+        DEC     HL
+.kinc:
+        LD      E,(HL)                      ; k = freq[c] -> DE ; HL = &freq[c].hi
+        INC     HL
+        LD      D,(HL)
+        LD      (Lh1K),DE                   ; k нужен Lh1UpdateSwap
+        INC     HL                          ; -> &freq[l].lo (freq[c+1] смежно)
+        LD      C,(HL)
+        INC     HL
+        LD      B,(HL)                      ; BC = freq[l]
+        LD      HL,(Lh1Cv)                  ; l = c+1 (нужен Lh1UpdateSwap)
         INC     HL
         LD      (Lh1L),HL
-        LD      DE,FreqBase                 ; freq[l]
-        CALL    Lh1GetWord
-        LD      DE,(Lh1K)                   ; k > freq[l] ?
-        EX      DE,HL                       ; HL=k, DE=freq[l]
-        OR      A
-        SBC     HL,DE
+        LD      H,D                         ; HL = k
+        LD      L,E
+        OR      A                           ; k > freq[l] ?
+        SBC     HL,BC
         JR      Z,.noswap
         JR      C,.noswap
-        CALL    Lh1UpdateSwap
+        CALL    Lh1UpdateSwap               ; сам ставит Lh1Cv = l
 .noswap:
-        LD      HL,(Lh1Cv)                  ; c = prnt[c]
+        LD      HL,(Lh1Cv)                  ; c = prnt[c] (инлайн Lh1GetWord)
+        ADD     HL,HL
         LD      DE,PrntBase
-        CALL    Lh1GetWord
+        ADD     HL,DE
+        LD      A,(HL)
+        INC     HL
+        LD      H,(HL)
+        LD      L,A
         LD      (Lh1Cv),HL
         LD      A,H
         OR      L
         JR      NZ,.uloop
         RET
 
+; Инлайн Lh1GetWord/Lh1PutWord по всем сайтам (свопы часты при перестройке дерева).
+; GetWord: ADD HL,HL / ADD HL,DE / LD A,(HL)/INC HL/LD H,(HL)/LD L,A.
+; PutWord: ADD HL,HL / ADD HL,DE / LD (HL),C/INC HL/LD (HL),B.
 Lh1UpdateSwap:
 .fl:
         LD      HL,(Lh1L)                   ; while k > freq[l+1]: l++
         INC     HL
+        ADD     HL,HL                       ; freq[l+1]
         LD      DE,FreqBase
-        CALL    Lh1GetWord
+        ADD     HL,DE
+        LD      A,(HL)
+        INC     HL
+        LD      H,(HL)
+        LD      L,A
         LD      DE,(Lh1K)
         EX      DE,HL                       ; HL=k, DE=freq[l+1]
         OR      A
@@ -495,25 +550,47 @@ Lh1UpdateSwap:
         JR      .fl
 .fld:
         LD      HL,(Lh1L)                   ; freq[c] = freq[l]
+        ADD     HL,HL
         LD      DE,FreqBase
-        CALL    Lh1GetWord
+        ADD     HL,DE
+        LD      A,(HL)
+        INC     HL
+        LD      H,(HL)
+        LD      L,A                         ; HL = freq[l]
         LD      B,H
         LD      C,L
         LD      HL,(Lh1Cv)
+        ADD     HL,HL
         LD      DE,FreqBase
-        CALL    Lh1PutWord
+        ADD     HL,DE
+        LD      (HL),C                      ; freq[c] = freq[l]
+        INC     HL
+        LD      (HL),B
         LD      BC,(Lh1K)                   ; freq[l] = k
         LD      HL,(Lh1L)
+        ADD     HL,HL
         LD      DE,FreqBase
-        CALL    Lh1PutWord
+        ADD     HL,DE
+        LD      (HL),C
+        INC     HL
+        LD      (HL),B
         LD      HL,(Lh1Cv)                  ; i = son[c]
+        ADD     HL,HL
         LD      DE,SonBase
-        CALL    Lh1GetWord
+        ADD     HL,DE
+        LD      A,(HL)
+        INC     HL
+        LD      H,(HL)
+        LD      L,A
         LD      (Lh1Ti),HL
         LD      BC,(Lh1L)                   ; prnt[i] = l
         LD      HL,(Lh1Ti)
+        ADD     HL,HL
         LD      DE,PrntBase
-        CALL    Lh1PutWord
+        ADD     HL,DE
+        LD      (HL),C
+        INC     HL
+        LD      (HL),B
         LD      HL,(Lh1Ti)                  ; if i<T: prnt[i+1]=l
         LD      DE,LH1_T
         OR      A
@@ -522,21 +599,38 @@ Lh1UpdateSwap:
         LD      BC,(Lh1L)
         LD      HL,(Lh1Ti)
         INC     HL
+        ADD     HL,HL
         LD      DE,PrntBase
-        CALL    Lh1PutWord
+        ADD     HL,DE
+        LD      (HL),C
+        INC     HL
+        LD      (HL),B
 .skip1:
         LD      HL,(Lh1L)                   ; jj = son[l]
+        ADD     HL,HL
         LD      DE,SonBase
-        CALL    Lh1GetWord
+        ADD     HL,DE
+        LD      A,(HL)
+        INC     HL
+        LD      H,(HL)
+        LD      L,A
         LD      (Lh1Tj),HL
         LD      BC,(Lh1Ti)                  ; son[l] = i
         LD      HL,(Lh1L)
+        ADD     HL,HL
         LD      DE,SonBase
-        CALL    Lh1PutWord
+        ADD     HL,DE
+        LD      (HL),C
+        INC     HL
+        LD      (HL),B
         LD      BC,(Lh1Cv)                  ; prnt[jj] = c
         LD      HL,(Lh1Tj)
+        ADD     HL,HL
         LD      DE,PrntBase
-        CALL    Lh1PutWord
+        ADD     HL,DE
+        LD      (HL),C
+        INC     HL
+        LD      (HL),B
         LD      HL,(Lh1Tj)                  ; if jj<T: prnt[jj+1]=c
         LD      DE,LH1_T
         OR      A
@@ -545,13 +639,21 @@ Lh1UpdateSwap:
         LD      BC,(Lh1Cv)
         LD      HL,(Lh1Tj)
         INC     HL
+        ADD     HL,HL
         LD      DE,PrntBase
-        CALL    Lh1PutWord
+        ADD     HL,DE
+        LD      (HL),C
+        INC     HL
+        LD      (HL),B
 .skip2:
         LD      BC,(Lh1Tj)                  ; son[c] = jj
         LD      HL,(Lh1Cv)
+        ADD     HL,HL
         LD      DE,SonBase
-        CALL    Lh1PutWord
+        ADD     HL,DE
+        LD      (HL),C
+        INC     HL
+        LD      (HL),B
         LD      HL,(Lh1L)                   ; c = l
         LD      (Lh1Cv),HL
         RET
@@ -767,28 +869,4 @@ Lh1CacheStoredEnd:
 ; ====================================================================
         INCLUDE "dtables.inc"
 
-; ====================================================================
-; Переменные -lh1- (WIN1).
-; ====================================================================
-Lh1R:           DW      0
-Lh1OutPos:      DW      0
-Lh1Len:         DW      0
-Lh1MatchI:      DW      0
-Lh1I:           DW      0
-Lh1J:           DW      0
-Lh1Cv:          DW      0
-Lh1K:           DW      0
-Lh1L:           DW      0
-Lh1Ti:          DW      0
-Lh1Tj:          DW      0
-Lh1Pos:         DW      0
-Lh1C:           DW      0
-Lh1I8:          DB      0
-Lh1JBits:       DB      0
-Lh1Ri:          DW      0
-Lh1Rj:          DW      0
-Lh1Rk:          DW      0
-Lh1Rf:          DW      0
-Lh1Rcnt:        DW      0
-Lh1Rsrc:        DW      0
-Lh1Tson:        DW      0
+; Переменные -lh1- теперь в SRAM WIN0 (см. блок Lh1Vars в начале файла, этап 5O-3).

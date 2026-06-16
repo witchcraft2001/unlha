@@ -16,6 +16,8 @@ UnlhaOrg        EQU #4200
 UnlhaStack      EQU #7FFE
 ExeVersion      EQU 1
 ListPageLines   EQU 22                  ; строк на экран перед паузой
+KbCtrlMask      EQU #2A                 ; KB_CTRL|KB_L_CTRL|KB_R_CTRL (Ctrl зажат)
+ScanCodeC       EQU #AC                 ; scancode 'C' (для Ctrl+C)
 
         ORG     UnlhaOrg - DSS_EXE_HEADER_SIZE
         DSS_EXE_HEADER ExeVersion, #0000, UnlhaOrg, UnlhaOrg, UnlhaStack
@@ -242,6 +244,8 @@ ListArchive:
         XOR     A
         LD      (LineCount),A
 .loop:
+        CALL    PollAbort                   ; Esc/Ctrl+C -> прервать список
+        JR      C,.abort
         LD      HL,HdrBuf                   ; читать фиксированную часть (22 байта)
         LD      DE,22
         LD      A,(ArcHandle)
@@ -281,6 +285,7 @@ ListArchive:
         JR      C,.done
         JR      .loop
 .abort:
+        CALL    AbortMsg                    ; "Aborted" + код возврата 1
         LD      A,1
         RET
 .done:
@@ -607,6 +612,8 @@ ExtractArchive:
         CALL    PrepareOutBase
         CALL    EnsureOutDir                ; создать выходной каталог при необходимости
 .loop:
+        CALL    PollAbort                   ; Esc/Ctrl+C -> прервать распаковку
+        JP      C,.aborted
         CALL    SeekToRecord
         JP      C,.done
         LD      HL,HdrBuf                   ; фиксированная часть (22 байта)
@@ -668,6 +675,9 @@ ExtractArchive:
         LD      (RecordStart+2),HL
         JP      .loop
 .done:
+        RET
+.aborted:
+        CALL    AbortMsg
         RET
 
 ; Перемотка к RecordStart (FromStart). CF=1 при ошибке.
@@ -1243,6 +1253,50 @@ SetExitCode:                                ; A=код, хранится пер�
         RET
 
 ; ====================================================================
+; Неблокирующий опрос клавиатуры (как EXTRACT_POLL_ABORT/LIST_KEY_IS_ABORT
+; в sprinter-unzip). CF=1, если запрошено прерывание (Esc или Ctrl+C).
+; Портит AF; сохраняет BC/DE/HL. Вызывать только вне SRAM-кэша (это DSS).
+; Dss.ScanKey: Z=нет клавиши; A/E=ASCII, B=модификаторы, D=scancode.
+; ====================================================================
+PollAbort:
+        PUSH    HL
+        PUSH    DE
+        PUSH    BC
+        LD      C,Dss.ScanKey
+        RST     Dss.Rst
+        JR      Z,.no                       ; клавиша не нажата
+        CP      27                          ; A = Esc?
+        JR      Z,.yes
+        LD      A,E                         ; альт. ASCII = Esc?
+        CP      27
+        JR      Z,.yes
+        LD      A,B                         ; Ctrl зажат?
+        AND     KbCtrlMask
+        JR      Z,.no
+        LD      A,D                         ; scancode 'C' (Ctrl+C)?
+        CP      ScanCodeC
+        JR      Z,.yes
+.no:
+        POP     BC
+        POP     DE
+        POP     HL
+        OR      A                           ; CF=0
+        RET
+.yes:
+        POP     BC
+        POP     DE
+        POP     HL
+        SCF
+        RET
+
+; Прерывание: печать "Aborted" + код возврата 1 (первая ненулевая ошибка).
+AbortMsg:
+        LD      A,1
+        CALL    SetExitCode
+        LD      HL,MsgAborted
+        JP      PrintString
+
+; ====================================================================
 ; Утилиты со строками
 ; ====================================================================
 CopyStr:                                    ; HL -> DE (ASCIIZ)
@@ -1346,6 +1400,8 @@ MsgUnsupLevel:
         DB      "header level 2/3 not supported yet", 13, 10, 0
 MsgNoMem:
         DB      "no memory for decode", 13, 10, 0
+MsgAborted:
+        DB      13, 10, "Aborted", 13, 10, 0
 MsgCreateErr2:
         DB      "cannot create", 13, 10, 0
 MethodDir:

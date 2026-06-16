@@ -164,4 +164,5 @@ CacheCodeStoredEnd:
         ASSERT  SonBase  >= FreqBase + (LH1_T+1)*2
         ASSERT  PrntBase >= SonBase + LH1_T*2
         ASSERT  SramLh1Code >= PrntBase + (LH1_T+LH1_NCHAR)*2  ; ядро после массивов
-        ASSERT  Lh1CacheRuntimeEnd <= SramCrcTableLo           ; ядро до CRC-таблицы
+        ASSERT  Lh1Vars >= Lh1CacheRuntimeEnd                  ; переменные после кода
+        ASSERT  Lh1VarsEnd <= SramCrcTableLo                   ; переменные до CRC-таблицы

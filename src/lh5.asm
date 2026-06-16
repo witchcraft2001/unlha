@@ -445,12 +445,16 @@ DecodeC:                                    ; -> HL = символ (0..NC-1)
         INC     HL
         LD      D,(HL)
         EX      DE,HL                       ; HL = j
-        LD      DE,LH5_NC
-        PUSH    HL
+        ; j < NC (510 = #01FE)? побайтово, без порчи HL (на каждый символ)
+        LD      A,H
         OR      A
-        SBC     HL,DE
-        POP     HL
-        JR      C,.leaf                     ; j < NC
+        JR      Z,.leaf                     ; H==0 -> j<256 -> leaf
+        DEC     A
+        JR      NZ,.bigj                    ; H>=2 -> j>=512 -> обход дерева
+        LD      A,L                         ; H==1
+        CP      #FE
+        JR      C,.leaf                     ; L<#FE -> j<510 -> leaf
+.bigj:
         LD      C,#08                       ; mask = 1<<(15-12)
 .walk:
         LD      A,(BitBuf)

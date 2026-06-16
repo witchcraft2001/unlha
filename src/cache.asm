@@ -91,28 +91,25 @@ BuildCrc16Table:
 ; границах верхнего уровня: InitSramBundle, Crc16Update (вне кэша), конец
 ; DecodeLh1. На DSS-границах внутри декода EI не делается (DI держится).
 ; ====================================================================
+; По manual + FPGA (SP2_ACEX.TDF): CASH_ON защёлкивается ТОЛЬКО от IN #FB/#7B
+; (бит A7), SYS-режим DSS не трогаем — он остаётся как выставил DSS, поэтому при
+; CASH_OFF WIN0 видит DSS-ROM (RST #10 работает), а при CASH_ON — SRAM.
+; Портит только AF.
 EnterCacheWindow:
-        PUSH    BC
-        XOR     A
-        LD      BC,ISA.System               ; #1FFD
-        OUT     (C),A                       ; ISA system <- 0
-        LD      A,SysMapCache
-        OUT     (SYS_PORT_OFF),A            ; #3C <- 4 (режим SRAM)
-        DI
-        IN      A,(CacheOnPort)             ; CASH_ON = 1
-        POP     BC
+        DI                                  ; в кэш-окне прерывания нельзя
+        IN      A,(CacheOnPort)             ; CASH_ON = 1 (WIN0 = SRAM)
         RET
 
 RestoreSystemWindow:                        ; CASH_OFF; прерывания не трогаем
-        PUSH    BC
-        IN      A,(CacheOffPort)            ; CASH_ON = 0
-        LD      A,SysMapDss
-        OUT     (SYS_PORT_OFF),A            ; #3C <- 3 (режим DSS)
-        LD      BC,ISA.System
-        LD      A,IsaSystemDss
-        OUT     (C),A                       ; ISA system <- 1
-        POP     BC
+        IN      A,(CacheOffPort)            ; CASH_ON = 0 (WIN0 -> DSS-ROM/DRAM)
         RET
+
+; --- ОТКАТ, если на железе голого #FB/#7B окажется недостаточно (как уверяют
+;     modplay/gifview/sprinter-unzip для DSS-EXE) — вернуть полную последовательность:
+;   EnterCacheWindow:  PUSH BC / XOR A / LD BC,#1FFD / OUT (C),A / LD A,#04 /
+;                      OUT (#3C),A / DI / IN A,(#FB) / POP BC / RET
+;   RestoreSystemWindow: PUSH BC / IN A,(#7B) / LD A,#03 / OUT (#3C),A /
+;                      LD BC,#1FFD / LD A,#01 / OUT (C),A / POP BC / RET
 
 ; ====================================================================
 ; SRAM-бандл: хранится в EXE, копируется в SramCacheCode, исполняется

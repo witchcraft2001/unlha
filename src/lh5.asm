@@ -17,7 +17,7 @@ LH5_TBIT        EQU 5
 LH5_THRESHOLD   EQU 3
 LH5_DICSIZ      EQU 8192
 LH5_DICMASK     EQU 8191
-InBufLen        EQU 1024
+InBufLen        EQU 2048
 
 ; --- Раскладка данных -lh5- ---
 RingBufBase     EQU #8000           ; кольцевое окно/выход (8192)
@@ -215,19 +215,22 @@ OutByteCount:
         LD      HL,0
         LD      (RingPos),HL
 .noflush:
-        ; Remaining--
+        ; Remaining--: старшие байты трогаем только при borrow.
         LD      HL,Remaining
         LD      A,(HL)
         SUB     1
         LD      (HL),A
+        RET     NC
         INC     HL
         LD      A,(HL)
         SBC     A,0
         LD      (HL),A
+        RET     NC
         INC     HL
         LD      A,(HL)
         SBC     A,0
         LD      (HL),A
+        RET     NC
         INC     HL
         LD      A,(HL)
         SBC     A,0

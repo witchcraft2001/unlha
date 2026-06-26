@@ -338,10 +338,6 @@ DecodePosition:
         ADD     HL,HL
         ADD     HL,HL
         LD      (Lh1C),HL
-        LD      A,(Lh1I8)                   ; i (16-бит) = байт
-        LD      L,A
-        LD      H,0
-        LD      (Lh1Pos),HL
         LD      A,(Lh1I8)                   ; j = d_len[i] - 2
         LD      L,A
         LD      H,0
@@ -349,28 +345,19 @@ DecodePosition:
         ADD     HL,DE
         LD      A,(HL)
         SUB     2
-        LD      (Lh1JBits),A
-.lp:
-        LD      A,(Lh1JBits)
-        OR      A
-        JR      Z,.fin
+        LD      B,A                         ; хвост позиции читается одним GetBits(j)
+        LD      A,(Lh1I8)
+        LD      C,A
+        LD      A,B
+.sh:
+        SLA     C                           ; C = low8(i << j)
         DEC     A
-        LD      (Lh1JBits),A
-        LD      HL,(Lh1Pos)                 ; i <<= 1
-        ADD     HL,HL
-        LD      (Lh1Pos),HL
-        LD      B,1
-        CALL    CacheGetBits                ; bit (SRAM-битридер)
-        LD      A,L
-        OR      A
-        JR      Z,.lp
-        LD      HL,(Lh1Pos)                 ; i |= 1
-        SET     0,L
-        LD      (Lh1Pos),HL
-        JR      .lp
-.fin:
-        LD      HL,(Lh1Pos)                 ; return c | (i & 0x3F)
-        LD      A,L
+        JR      NZ,.sh
+        LD      A,C
+        PUSH    AF                          ; CacheGetBits портит C
+        CALL    CacheGetBits                ; HL = getbits(j)
+        POP     AF
+        OR      L                           ; ((i << j) | bits) & 0x3F
         AND     #3F
         LD      L,A
         LD      H,0
@@ -908,18 +895,21 @@ Lh1PutByte:
         LD      HL,0
         LD      (Lh1OutPos),HL              ; CASH_ON -> запись SRAM-переменной OK
 .nf:
-        LD      HL,Remaining                ; Remaining-- (32-бит, DRAM)
+        LD      HL,Remaining                ; Remaining--; старшие байты только при borrow
         LD      A,(HL)
         SUB     1
         LD      (HL),A
+        RET     NC
         INC     HL
         LD      A,(HL)
         SBC     A,0
         LD      (HL),A
+        RET     NC
         INC     HL
         LD      A,(HL)
         SBC     A,0
         LD      (HL),A
+        RET     NC
         INC     HL
         LD      A,(HL)
         SBC     A,0

@@ -1000,6 +1000,7 @@ ExtractArchive:
         OR      A
         JP      NZ,.done
 .advance:
+        CALL    ComputeNextRecord           ; защититься от порчи NextRecord в декодере
         LD      HL,(NextRecord)             ; RecordStart = NextRecord
         LD      (RecordStart),HL
         LD      HL,(NextRecord+2)
@@ -1211,22 +1212,44 @@ ExtractEntry:
         CALL    OpenOutForEntry
         RET     C
         CALL    DecodeLh1
-        CALL    CloseOutput
+        PUSH    AF
+        CALL    CloseOutputChecked
+        JR      C,.lh1CloseErr
+        POP     AF
+        JP      C,ReportDecodeError
         JP      VerifyCrc
+.lh1CloseErr:
+        POP     AF
+        JP      ReportDecodeError
 .stored:
         CALL    OpenOutForEntry             ; CF=1 -> пропуск
         RET     C
+        CALL    ClearDecodeError
         CALL    ExtractStored
-        CALL    CloseOutput
+        PUSH    AF
+        CALL    CloseOutputChecked
+        JR      C,.storedCloseErr
+        POP     AF
+        JP      C,ReportDecodeError
         JP      VerifyCrc
+.storedCloseErr:
+        POP     AF
+        JP      ReportDecodeError
 .lh5:
         CALL    EnsurePages
         JR      C,.noMem
         CALL    OpenOutForEntry
         RET     C
         CALL    DecodeLh5
-        CALL    CloseOutput
+        PUSH    AF
+        CALL    CloseOutputChecked
+        JR      C,.lh5CloseErr
+        POP     AF
+        JP      C,ReportDecodeError
         JP      VerifyCrc
+.lh5CloseErr:
+        POP     AF
+        JP      ReportDecodeError
 .noMem:
         LD      HL,NameBuf
         CALL    PrintName
@@ -1340,22 +1363,31 @@ ExtractStored:
         LD      A,(ArcHandle)
         LD      C,Dss.Read
         RST     Dss.Rst
-        POP     BC
-        RET     C
-        PUSH    BC                          ; CRC по прочитанному блоку
+        POP     BC                          ; запрошенный ChunkLen больше не нужен
+        JR      C,.readErr
+        LD      A,D
+        OR      E
+        JR      Z,.shortRead
+        LD      (ChunkLen),DE               ; вычитать фактически прочитанное
+        LD      B,D
+        LD      C,E
+        PUSH    BC                          ; CRC по фактически прочитанному блоку
         LD      HL,CopyBuf
         CALL    Crc16Update
-        POP     BC
-        LD      H,B                         ; записать ChunkLen в выход
-        LD      L,C
-        EX      DE,HL                       ; DE = ChunkLen
+        POP     DE
         LD      HL,CopyBuf
-        LD      A,(OutHandle)
-        LD      C,Dss.Write
-        RST     Dss.Rst
+        CALL    WriteOutputFull
         RET     C
         CALL    SubChunk                    ; Remaining -= ChunkLen
         JR      .loop
+.readErr:
+        CALL    SetDecodeErrorA
+        SCF
+        RET
+.shortRead:
+        CALL    SetDecodeReadError
+        SCF
+        RET
 
 ; ChunkLen = min(Remaining, размер CopyBuf). Результат в DE и (ChunkLen).
 ComputeChunk:
@@ -1427,6 +1459,18 @@ VerifyCrc:
         LD      HL,MsgBadCrc
         CALL    PrintString
         LD      A,#17
+        JP      SetExitCode
+
+ReportDecodeError:
+        LD      HL,NameBuf
+        CALL    PrintName
+        LD      HL,MsgIoError
+        CALL    PrintString
+        LD      A,(DecodeErrorCode)
+        OR      A
+        JR      NZ,.set
+        LD      A,Dss.Err.WriteError
+.set:
         JP      SetExitCode
 
 ; Печать имени записи + разделитель.
@@ -1735,6 +1779,43 @@ CloseOutput:
         RST     Dss.Rst
         RET
 
+CloseOutputChecked:
+        CALL    CloseOutput
+        RET     NC
+        CALL    SetDecodeErrorA
+        SCF
+        RET
+
+ClearDecodeError:
+        XOR     A
+        LD      (DecodeErrorFlag),A
+        LD      (DecodeErrorCode),A
+        RET
+
+SetDecodeReadError:
+        LD      A,Dss.Err.ReadError
+        JR      SetDecodeErrorA
+
+SetDecodeErrorA:
+        LD      (DecodeErrorCode),A
+        LD      A,1
+        LD      (DecodeErrorFlag),A
+        RET
+
+; Записать буфер: HL=адрес, DE=размер. CF=1 -> DecodeError выставлен.
+WriteOutputFull:
+        LD      A,(OutHandle)
+        LD      C,Dss.Write
+        RST     Dss.Rst
+        JR      C,.writeErr
+        OR      A
+        JR      NZ,.writeErr
+        RET
+.writeErr:
+        CALL    SetDecodeErrorA
+        SCF
+        RET
+
 SetExitCode:                                ; A=код, хранится первый ненулевой
         PUSH    HL
         PUSH    AF
@@ -1893,6 +1974,8 @@ MsgOk:
         DB      "OK", 13, 10, 0
 MsgBadCrc:
         DB      "CRC ERROR", 13, 10, 0
+MsgIoError:
+        DB      "I/O ERROR", 13, 10, 0
 MsgExists:
         DB      "exists", 13, 10, 0
 MsgOverwriteQ:
@@ -2026,7 +2109,9 @@ ExtSize         EQU ExpectedCrc + 2
 ChunkLen        EQU ExtSize + 2
 Crc16           EQU ChunkLen + 2
 CacheHeld       EQU Crc16 + 2
-ParamBuf        EQU CacheHeld + 1
+DecodeErrorFlag EQU CacheHeld + 1
+DecodeErrorCode EQU DecodeErrorFlag + 1
+ParamBuf        EQU DecodeErrorCode + 1
 ArchivePath     EQU ParamBuf + 128
 OutOrListPath   EQU ArchivePath + 128
 MaskBuf         EQU OutOrListPath + 128

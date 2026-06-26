@@ -53,6 +53,7 @@ SramLh5CrcTableHi EQU #3F00
 ; выходной файл создан (OutHandle). orig в HdrBuf+#0B.
 ; ====================================================================
 DecodeLh5:
+        CALL    ClearDecodeError
         CALL    GetFilePos                  ; HL:IX = data_start
         LD      (DataStart),IX
         LD      (DataStart+2),HL
@@ -70,11 +71,22 @@ DecodeLh5:
         LD      (CacheHeld),A
         CALL    EnterCacheWindowLh5
         CALL    Lh5DecodeLoop
+        LD      A,(DecodeErrorFlag)
+        OR      A
+        JR      NZ,.done
         CALL    FlushRing                   ; дослать остаток окна + CRC
+.done:
         CALL    RestoreSystemWindow
         EI
         XOR     A
         LD      (CacheHeld),A
+        LD      A,(DecodeErrorFlag)
+        OR      A
+        JR      NZ,.err
+        OR      A
+        RET
+.err:
+        SCF
         RET
 
 GetFilePos:                                 ; -> HL:IX = текущая позиция
@@ -106,14 +118,23 @@ Lh5CacheStored:
 
 Lh5DecodeLoop:
 .loop:
+        LD      A,(DecodeErrorFlag)
+        OR      A
+        RET     NZ
         CALL    RemainingZero
         RET     Z
         CALL    DecodeC                     ; HL = символ
+        LD      A,(DecodeErrorFlag)
+        OR      A
+        RET     NZ
         LD      A,H
         OR      A
         JR      NZ,.match                   ; >=256 -> совпадение
         LD      A,L                         ; литерал
         CALL    OutByteCount
+        LD      A,(DecodeErrorFlag)
+        OR      A
+        RET     NZ
         JR      .loop
 .match:
         LD      DE,256-LH5_THRESHOLD         ; len = c - 256 + THRESHOLD = c - 253
@@ -121,6 +142,9 @@ Lh5DecodeLoop:
         SBC     HL,DE
         PUSH    HL                          ; сохранить len через DecodeP (в стеке)
         CALL    DecodeP                     ; HL = p (дистанция-1)
+        LD      A,(DecodeErrorFlag)
+        OR      A
+        JR      NZ,.dropLen
         EX      DE,HL                       ; DE = p (без MatchDist в памяти)
         LD      HL,(RingPos)                ; src = (r - p - 1) & DICMASK
         OR      A
@@ -150,10 +174,16 @@ Lh5DecodeLoop:
         LD      A,E
         CALL    OutByteCount
         POP     BC
+        LD      A,(DecodeErrorFlag)
+        OR      A
+        RET     NZ
         DEC     BC
         CALL    RemainingZero
         RET     Z
         JR      .copy
+.dropLen:
+        POP     HL
+        RET
 
 RemainingZero:                              ; Z=1, если Remaining==0
         LD      A,(Remaining)
@@ -1114,10 +1144,20 @@ FlushRing:
         LD      A,(OutHandle)
         LD      C,Dss.Write
         RST     Dss.Rst
+        PUSH    AF
         CALL    MapDataPages
         LD      A,(CacheHeld)
         OR      A
         CALL    NZ,EnterHeldCacheWindow
+        POP     AF
+        JR      C,.writeErr
+        OR      A
+        JR      NZ,.writeErr
+        LD      HL,0
+        LD      (RingPos),HL
+        RET
+.writeErr:
+        CALL    SetDecodeErrorA
         RET
 
 ; ====================================================================
@@ -1255,23 +1295,37 @@ RefillInBuf:                                ; CF=1 если данных бол�
         LD      A,(ArcHandle)
         LD      C,Dss.Read
         RST     Dss.Rst
+        PUSH    AF
         CALL    MapDataPages
         LD      A,(CacheHeld)
         OR      A
         CALL    NZ,EnterHeldCacheWindow
+        POP     AF
         POP     BC
-        LD      (InCnt),BC
+        JR      C,.readErr
+        LD      A,D
+        OR      E
+        JR      Z,.shortRead
+        LD      (InCnt),DE
         LD      HL,0
         LD      (InPos),HL
-        LD      HL,(CompRemaining)          ; CompRemaining -= BC
+        LD      HL,(CompRemaining)          ; CompRemaining -= фактически прочитанное
         OR      A
-        SBC     HL,BC
+        SBC     HL,DE
         LD      (CompRemaining),HL
         LD      HL,(CompRemaining+2)
-        LD      BC,0
-        SBC     HL,BC
+        LD      DE,0
+        SBC     HL,DE
         LD      (CompRemaining+2),HL
         OR      A
+        RET
+.readErr:
+        CALL    SetDecodeErrorA
+        SCF
+        RET
+.shortRead:
+        CALL    SetDecodeReadError
+        SCF
         RET
 .none:
         SCF

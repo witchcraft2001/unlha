@@ -61,6 +61,7 @@ Lh1VarsEnd      EQU Lh1Tson + 2
 
 ; ====================================================================
 DecodeLh1:
+        CALL    ClearDecodeError
         CALL    GetFilePos
         LD      (DataStart),IX
         LD      (DataStart+2),HL
@@ -88,6 +89,13 @@ DecodeLh1:
         EI                                  ; вернуть обычный поток DSS (EI)
         XOR     A
         LD      (CacheHeld),A
+        LD      A,(DecodeErrorFlag)
+        OR      A
+        JR      NZ,.err
+        OR      A
+        RET
+.err:
+        SCF
         RET
 
 ; Окно: text_buf[0..N-F-1] = ' '(0x20), r = N-F.  (DRAM; пишет SRAM TextBuf)
@@ -123,10 +131,18 @@ Lh1Flush:
         LD      A,(OutHandle)
         LD      C,Dss.Write
         RST     Dss.Rst
+        PUSH    AF
         CALL    MapDataPages
         LD      A,(CacheHeld)
         OR      A
         CALL    NZ,EnterHeldCacheWindow
+        POP     AF
+        JR      C,.writeErr
+        OR      A
+        JR      NZ,.writeErr
+        RET
+.writeErr:
+        CALL    SetDecodeErrorA
         RET
 
 ; ====================================================================
@@ -927,14 +943,23 @@ CacheRemainingZero:
 ; (TextBufBase=#0000), без перезагрузки Lh1MatchI (адрес уже = индекс).
 CacheLh1Loop:
 .loop:
+        LD      A,(DecodeErrorFlag)
+        OR      A
+        RET     NZ
         CALL    CacheRemainingZero
         RET     Z
         CALL    DecodeChar                  ; HL = c
+        LD      A,(DecodeErrorFlag)
+        OR      A
+        RET     NZ
         LD      A,H
         OR      A
         JR      NZ,.match                   ; c >= 256
         LD      A,L
         CALL    Lh1PutByte
+        LD      A,(DecodeErrorFlag)
+        OR      A
+        RET     NZ
         JR      .loop
 .match:
         LD      DE,255-LH1_THRESH           ; len = c - 255 + THRESHOLD = c-253
@@ -942,6 +967,9 @@ CacheLh1Loop:
         SBC     HL,DE
         LD      (Lh1Len),HL
         CALL    DecodePosition              ; HL = pos
+        LD      A,(DecodeErrorFlag)
+        OR      A
+        RET     NZ
         EX      DE,HL                       ; DE = pos
         LD      HL,(Lh1R)                   ; i = (r - pos - 1) & (N-1)
         OR      A
@@ -968,6 +996,9 @@ CacheLh1Loop:
         LD      A,E
         CALL    Lh1PutByte
         POP     BC
+        LD      A,(DecodeErrorFlag)
+        OR      A
+        RET     NZ
         DEC     BC
         CALL    CacheRemainingZero
         RET     Z

@@ -28,6 +28,14 @@ if [ -d "$repo_root/test" ]; then
   for f in "$repo_root"/test/*.lzh "$repo_root"/test/*.LZH; do
     [ -f "$f" ] || continue
     base="$(basename "$f")"
+    if [ "${UNLHA_IMAGE_ALL_LZH:-0}" != "1" ]; then
+      case "$base" in
+        CPM431.lzh|CPM431.LZH)
+          echo "  $base  (ПРОПУЩЕН: UNLHA_IMAGE_ALL_LZH=1 для полного набора)"
+          continue
+          ;;
+      esac
+    fi
     upper="$(printf '%s' "$base" | tr 'a-z' 'A-Z')"
     mcopy -i "$image_path" -o "$f" "::$upper"
   done
@@ -38,10 +46,22 @@ if [ -d "$repo_root/test" ]; then
     base="$(basename "$f")"
     mcopy -i "$image_path" -o "$f" "::$base"
   done
-  # .lha — короткое 8.3-имя (длинные имена не влезают в FAT 8.3)
+  # .lha — короткое 8.3-имя (длинные имена не влезают в FAT 8.3).
+  # По умолчанию кладём только AttackOf...: его распаковка требует ~320K
+  # свободного места на той же дискете. Полный набор: UNLHA_IMAGE_ALL_LHA=1.
   for f in "$repo_root"/test/*.lha "$repo_root"/test/*.LHA; do
     [ -f "$f" ] || continue
-    stem="$(basename "$f")"; stem="${stem%.*}"
+    base="$(basename "$f")"
+    if [ "${UNLHA_IMAGE_ALL_LHA:-0}" != "1" ]; then
+      case "$base" in
+        AttackOfTheGreenSmellyAliensFromPlanet27b6_v1.0.lha|AttackOfTheGreenSmellyAliensFromPlanet27b6_v1.0.LHA) ;;
+        *)
+          echo "  $base  (ПРОПУЩЕН: UNLHA_IMAGE_ALL_LHA=1 для полного набора)"
+          continue
+          ;;
+      esac
+    fi
+    stem="$base"; stem="${stem%.*}"
     short="$(printf '%s' "$stem" | tr 'a-z' 'A-Z' | tr -cd 'A-Z0-9' | cut -c1-8)"
     if mcopy -i "$image_path" -o "$f" "::$short.LHA" 2>/dev/null; then
       echo "  $(basename "$f") -> $short.LHA"

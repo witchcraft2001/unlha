@@ -1,7 +1,8 @@
 ; ====================================================================
 ;   Декодер -lh5- (LHA AR002): LZSS + статический Хаффман (3 таблицы).
-;   Порт проверенного Python-эталона. Этап 3: реализация в DRAM
-;   (страницы WIN2/WIN3 под кольцевое окно и таблицы). SRAM — этап 5.
+;   Порт проверенного Python-эталона. Этап 5: Huffman workspace и CRC
+;   держатся в SRAM cache bank 1; кольцевое окно/выход остаётся в DRAM,
+;   потому что его читает DSS.Write при CASH_OFF.
 ; ====================================================================
 ; INCLUDE-ится в unlha.asm; использует ArcHandle, OutHandle, NextRecord,
 ; HdrBuf, Remaining, Crc16, Crc16Update, VerifyCrc, SetExitCode, MapPages.
@@ -18,18 +19,34 @@ LH5_DICSIZ      EQU 8192
 LH5_DICMASK     EQU 8191
 InBufLen        EQU 1024
 
-; --- Раскладка в выделенных страницах (WIN2 #8000, WIN3 #C000) ---
+; --- Раскладка данных -lh5- ---
 RingBufBase     EQU #8000           ; кольцевое окно/выход (8192)
-CTableBase      EQU #A000           ; 4096 слов (2^12)
-CLeftBase       EQU #C000           ; узлы дерева C
-CRightBase      EQU #C800
-PtTableBase     EQU #D000           ; 256 слов (2^8)
-PtLeftBase      EQU #D200
-PtRightBase     EQU #D280
-CLenBase        EQU #D300           ; длины кодов C (байты, NC)
-PtLenBase       EQU #D500           ; длины кодов PT (байты)
+CTableBase      EQU #0000           ; SRAM bank 1: 4096 слов (2^12)
+CLeftBase       EQU #2000           ; SRAM bank 1: узлы дерева C
+CRightBase      EQU #2800
+PtTableBase     EQU #3000           ; SRAM bank 1: 256 слов (2^8)
+PtLeftBase      EQU #3200
+PtRightBase     EQU #3280
+CLenBase        EQU #3300           ; SRAM bank 1: длины кодов C (байты, NC)
+PtLenBase       EQU #3500           ; SRAM bank 1: длины кодов PT (байты)
+SramLh5TablesEnd EQU #3520
+SramLh5Code     EQU #3520
+SramLh5CrcTableLo EQU #3E00
+SramLh5CrcTableHi EQU #3F00
 ; Буфер чтения сжатого потока (InBufBase) — в WIN1 (см. переменные ниже),
 ; т.к. Dss.Read может перенастраивать окна WIN2/WIN3.
+        ASSERT  CTableBase + 4096*2 <= CLeftBase
+        ASSERT  CLeftBase + #800 <= CRightBase
+        ASSERT  CRightBase + #800 <= PtTableBase
+        ASSERT  PtTableBase + 256*2 <= PtLeftBase
+        ASSERT  PtLeftBase + #80 <= PtRightBase
+        ASSERT  PtRightBase + #80 <= CLenBase
+        ASSERT  CLenBase + #200 <= PtLenBase
+        ASSERT  PtLenBase + #20 <= SramLh5TablesEnd
+        ASSERT  SramLh5Code >= SramLh5TablesEnd
+        ASSERT  SramLh5CrcTableLo >= SramLh5Code
+        ASSERT  SramLh5CrcTableHi == SramLh5CrcTableLo + #100
+        ASSERT  SramLh5CrcTableHi + #100 <= #4000
 
 ; ====================================================================
 ; Вход: распаковать текущую -lh5- запись. Файл стоит на начале данных,
@@ -49,8 +66,15 @@ DecodeLh5:
         LD      (Crc16),HL
         LD      (RingPos),HL
         LD      (BlockSize),HL
+        LD      A,CacheBankLh5 + 1          ; CacheHeld=2 -> re-enter SRAM bank 1
+        LD      (CacheHeld),A
+        CALL    EnterCacheWindowLh5
         CALL    Lh5DecodeLoop
         CALL    FlushRing                   ; дослать остаток окна + CRC
+        CALL    RestoreSystemWindow
+        EI
+        XOR     A
+        LD      (CacheHeld),A
         RET
 
 GetFilePos:                                 ; -> HL:IX = текущая позиция
@@ -74,8 +98,12 @@ CalcCompRemaining:                          ; CompRemaining = NextRecord - DataS
         RET
 
 ; ====================================================================
-; Главный цикл декодирования.
+; SRAM bank 1 runtime image for -lh5-. Содержит горячий цикл, Huffman
+; decode/build и локальный CRC16 code. DSS/BIOS-трамплины ниже остаются в DRAM.
 ; ====================================================================
+Lh5CacheStored:
+        DISP    SramLh5Code
+
 Lh5DecodeLoop:
 .loop:
         CALL    RemainingZero
@@ -174,246 +202,6 @@ OutByteCount:
         LD      A,(HL)
         SBC     A,0
         LD      (HL),A
-        RET
-
-; Сбросить RingPos байт из RingBufBase: CRC + запись в файл.
-FlushRing:
-        LD      HL,(RingPos)
-        LD      A,H
-        OR      L
-        RET     Z
-        LD      BC,(RingPos)
-        LD      HL,RingBufBase
-        CALL    Crc16Update
-        LD      DE,(RingPos)
-        LD      HL,RingBufBase
-        LD      A,(OutHandle)
-        LD      C,Dss.Write
-        RST     Dss.Rst
-        CALL    MapDataPages
-        RET
-
-; ====================================================================
-; Битовый поток (MSB-first, модель LHA: BitBuf = следующие 16 бит).
-; Этап 3 — побитовое заполнение (корректность); ускорение — этап 5.
-; ====================================================================
-InitBitReader:
-        LD      HL,0
-        LD      (InPos),HL
-        LD      (InCnt),HL
-        LD      (BitBuf),HL
-        XOR     A
-        LD      (InBitsLeft),A
-        LD      B,16
-        CALL    FillBuf
-        RET
-
-; PeekBits недоступен отдельно; GetBits(B=n) -> HL, и потребляет n бит.
-GetBits:
-        LD      A,B
-        OR      A
-        JR      NZ,.nz
-        LD      HL,0
-        RET
-.nz:
-        ; result = верхние B бит BitBuf. Извлекаем сдвигом ВЛЕВО за B итераций
-        ; (вместо 16-B вправо) — выгодно для частого B=1 (обход дерева: 1 vs 15).
-        LD      HL,(BitBuf)
-        LD      DE,0
-        LD      A,B
-.ex:
-        ADD     HL,HL                       ; bit15 -> CF
-        RL      E
-        RL      D
-        DEC     A
-        JR      NZ,.ex
-        PUSH    DE                          ; результат (B сохранён для FillBuf)
-        CALL    FillBuf                     ; продвинуть поток на B бит
-        POP     HL                          ; -> HL
-        RET
-
-; FillBuf(B=n): сдвинуть BitBuf влево на n, втянув n новых бит.
-; FillBuf(B=n): втянуть n бит в BitBuf (побайтовая модель LHA).
-; Состояние в регистрах: HL=BitBuf, D=InCur (валидные биты сверху), E=InBitsLeft.
-; Биты k-чанка вносятся плотным циклом SLA D / ADC HL,HL (без вызовов на бит).
-FillBuf:
-        LD      A,B
-        OR      A
-        RET     Z
-        LD      HL,(BitBuf)
-        LD      A,(InCur)
-        LD      D,A
-        LD      A,(InBitsLeft)
-        LD      E,A
-.loop:
-        LD      A,E                         ; нужен новый байт?
-        OR      A
-        JR      NZ,.have
-        PUSH    HL                          ; refill (редко) — InByte портит регистры
-        PUSH    DE
-        PUSH    BC
-        CALL    InByte
-        POP     BC
-        POP     DE
-        POP     HL
-        LD      D,A
-        LD      E,8
-.have:
-        LD      A,E                         ; k = min(n, InBitsLeft) -> C
-        CP      B
-        JR      NC,.kn
-        LD      C,A
-        JR      .dok
-.kn:
-        LD      C,B
-.dok:
-        LD      A,C                         ; внести k бит: верхний бит InCur -> младший BitBuf
-.sh:
-        SLA     D
-        ADC     HL,HL
-        DEC     A
-        JR      NZ,.sh
-        LD      A,E                         ; InBitsLeft -= k
-        SUB     C
-        LD      E,A
-        LD      A,B                         ; n -= k
-        SUB     C
-        LD      B,A
-        JR      NZ,.loop
-        LD      (BitBuf),HL                 ; сохранить состояние
-        LD      A,D
-        LD      (InCur),A
-        LD      A,E
-        LD      (InBitsLeft),A
-        RET
-
-InByte:                                     ; -> A = очередной сжатый байт (0 если конец)
-        LD      HL,(InPos)
-        LD      DE,(InCnt)
-        OR      A
-        SBC     HL,DE
-        JR      C,.get
-        CALL    RefillInBuf
-        JR      C,.zero
-.get:
-        LD      HL,(InPos)
-        LD      DE,InBufBase
-        ADD     HL,DE
-        LD      A,(HL)
-        LD      HL,(InPos)
-        INC     HL
-        LD      (InPos),HL
-        RET
-.zero:
-        XOR     A
-        RET
-
-RefillInBuf:                                ; CF=1 если данных больше нет
-        LD      HL,(CompRemaining)
-        LD      DE,(CompRemaining+2)
-        LD      A,H
-        OR      L
-        OR      D
-        OR      E
-        JR      Z,.none
-        CALL    CompInChunk                 ; BC = min(CompRemaining, InBufLen)
-        PUSH    BC
-        ; --- DSS-чтение на границе: Restore->DSS->Enter, БЕЗ EI (DI весь декод) ---
-        LD      A,(CacheHeld)
-        OR      A
-        CALL    NZ,RestoreSystemWindow
-        LD      HL,InBufBase
-        LD      D,B
-        LD      E,C
-        LD      A,(ArcHandle)
-        LD      C,Dss.Read
-        RST     Dss.Rst
-        CALL    MapDataPages
-        LD      A,(CacheHeld)
-        OR      A
-        CALL    NZ,EnterCacheWindow
-        POP     BC
-        LD      (InCnt),BC
-        LD      HL,0
-        LD      (InPos),HL
-        LD      HL,(CompRemaining)          ; CompRemaining -= BC
-        OR      A
-        SBC     HL,BC
-        LD      (CompRemaining),HL
-        LD      HL,(CompRemaining+2)
-        LD      BC,0
-        SBC     HL,BC
-        LD      (CompRemaining+2),HL
-        OR      A
-        RET
-.none:
-        SCF
-        RET
-
-CompInChunk:                                ; BC = min(CompRemaining, InBufLen)
-        LD      A,(CompRemaining+2)
-        LD      B,A
-        LD      A,(CompRemaining+3)
-        OR      B
-        JR      NZ,.full
-        LD      A,(CompRemaining+1)
-        CP      high(InBufLen)
-        JR      NC,.full
-        LD      BC,(CompRemaining)
-        RET
-.full:
-        LD      BC,InBufLen
-        RET
-
-; ====================================================================
-; Страницы памяти (WIN2/WIN3) под окно и таблицы.
-; ====================================================================
-EnsurePages:
-        LD      A,(PagesReady)
-        OR      A
-        JR      NZ,.ok
-        ; Выделить блок 2 страницы (DSS GetMem) -> A = id блока.
-        LD      B,2
-        LD      C,Dss.GetMem
-        RST     Dss.Rst
-        JR      C,.fail
-        LD      (MemBlock),A
-        ; Разрезолвить id блока в номера физ. страниц (BIOS EMM_FN5
-        ; выгружает список страниц блока в буфер HL) — как в gifview.
-        LD      HL,PageTable
-        LD      C,Bios.Emm_Fn5
-        RST     Bios.Rst
-        JR      C,.fail
-        LD      A,(PageTable)
-        LD      (PhysPage2),A
-        LD      A,(PageTable+1)
-        LD      (PhysPage3),A
-        CALL    MapDataPages
-        LD      A,1
-        LD      (PagesReady),A
-.ok:
-        OR      A
-        RET
-.fail:
-        SCF
-        RET
-
-MapDataPages:
-        LD      A,(PhysPage2)
-        OUT     (PAGE2),A
-        LD      A,(PhysPage3)
-        OUT     (PAGE3),A
-        RET
-
-FreePages:
-        LD      A,(PagesReady)
-        OR      A
-        RET     Z
-        LD      A,(MemBlock)
-        LD      C,Dss.FreeMem              ; освободить блок по id в A
-        RST     Dss.Rst
-        XOR     A
-        LD      (PagesReady),A
         RET
 
 ; ====================================================================
@@ -1276,6 +1064,284 @@ ShrHL_E:                                    ; HL >>= E (логический)
         SRL     H
         RR      L
         JR      .l
+
+CacheLh5Crc16Update:
+        LD      A,B
+        OR      C
+        RET     Z
+        PUSH    IY
+        PUSH    HL
+        POP     IY
+        LD      DE,(Crc16)
+.next:
+        LD      A,(IY+0)
+        INC     IY
+        XOR     E
+        LD      L,A
+        LD      H,high(SramLh5CrcTableLo)
+        LD      A,D
+        XOR     (HL)
+        LD      E,A
+        INC     H
+        LD      D,(HL)
+        DEC     BC
+        LD      A,B
+        OR      C
+        JR      NZ,.next
+        LD      (Crc16),DE
+        POP     IY
+        RET
+
+Lh5CacheRuntimeEnd:
+        ASSERT  Lh5CacheRuntimeEnd <= SramLh5CrcTableLo
+        ENT
+Lh5CacheStoredEnd:
+
+; Сбросить RingPos байт из RingBufBase: CRC + запись в файл.
+FlushRing:
+        LD      HL,(RingPos)
+        LD      A,H
+        OR      L
+        RET     Z
+        LD      BC,(RingPos)
+        LD      HL,RingBufBase
+        CALL    Crc16Update
+        LD      DE,(RingPos)
+        LD      HL,RingBufBase
+        LD      A,(CacheHeld)
+        OR      A
+        CALL    NZ,RestoreSystemWindow
+        LD      A,(OutHandle)
+        LD      C,Dss.Write
+        RST     Dss.Rst
+        CALL    MapDataPages
+        LD      A,(CacheHeld)
+        OR      A
+        CALL    NZ,EnterHeldCacheWindow
+        RET
+
+; ====================================================================
+; Битовый поток (MSB-first, модель LHA: BitBuf = следующие 16 бит).
+; Этап 3 — побитовое заполнение (корректность); ускорение — этап 5.
+; ====================================================================
+InitBitReader:
+        LD      HL,0
+        LD      (InPos),HL
+        LD      (InCnt),HL
+        LD      (BitBuf),HL
+        XOR     A
+        LD      (InBitsLeft),A
+        LD      B,16
+        CALL    FillBuf
+        RET
+
+; PeekBits недоступен отдельно; GetBits(B=n) -> HL, и потребляет n бит.
+GetBits:
+        LD      A,B
+        OR      A
+        JR      NZ,.nz
+        LD      HL,0
+        RET
+.nz:
+        ; result = верхние B бит BitBuf. Извлекаем сдвигом ВЛЕВО за B итераций
+        ; (вместо 16-B вправо) — выгодно для частого B=1 (обход дерева: 1 vs 15).
+        LD      HL,(BitBuf)
+        LD      DE,0
+        LD      A,B
+.ex:
+        ADD     HL,HL                       ; bit15 -> CF
+        RL      E
+        RL      D
+        DEC     A
+        JR      NZ,.ex
+        PUSH    DE                          ; результат (B сохранён для FillBuf)
+        CALL    FillBuf                     ; продвинуть поток на B бит
+        POP     HL                          ; -> HL
+        RET
+
+; FillBuf(B=n): сдвинуть BitBuf влево на n, втянув n новых бит.
+; FillBuf(B=n): втянуть n бит в BitBuf (побайтовая модель LHA).
+; Состояние в регистрах: HL=BitBuf, D=InCur (валидные биты сверху), E=InBitsLeft.
+; Биты k-чанка вносятся плотным циклом SLA D / ADC HL,HL (без вызовов на бит).
+FillBuf:
+        LD      A,B
+        OR      A
+        RET     Z
+        LD      HL,(BitBuf)
+        LD      A,(InCur)
+        LD      D,A
+        LD      A,(InBitsLeft)
+        LD      E,A
+.loop:
+        LD      A,E                         ; нужен новый байт?
+        OR      A
+        JR      NZ,.have
+        PUSH    HL                          ; refill (редко) — InByte портит регистры
+        PUSH    DE
+        PUSH    BC
+        CALL    InByte
+        POP     BC
+        POP     DE
+        POP     HL
+        LD      D,A
+        LD      E,8
+.have:
+        LD      A,E                         ; k = min(n, InBitsLeft) -> C
+        CP      B
+        JR      NC,.kn
+        LD      C,A
+        JR      .dok
+.kn:
+        LD      C,B
+.dok:
+        LD      A,C                         ; внести k бит: верхний бит InCur -> младший BitBuf
+.sh:
+        SLA     D
+        ADC     HL,HL
+        DEC     A
+        JR      NZ,.sh
+        LD      A,E                         ; InBitsLeft -= k
+        SUB     C
+        LD      E,A
+        LD      A,B                         ; n -= k
+        SUB     C
+        LD      B,A
+        JR      NZ,.loop
+        LD      (BitBuf),HL                 ; сохранить состояние
+        LD      A,D
+        LD      (InCur),A
+        LD      A,E
+        LD      (InBitsLeft),A
+        RET
+
+InByte:                                     ; -> A = очередной сжатый байт (0 если конец)
+        LD      HL,(InPos)
+        LD      DE,(InCnt)
+        OR      A
+        SBC     HL,DE
+        JR      C,.get
+        CALL    RefillInBuf
+        JR      C,.zero
+.get:
+        LD      HL,(InPos)
+        LD      DE,InBufBase
+        ADD     HL,DE
+        LD      A,(HL)
+        LD      HL,(InPos)
+        INC     HL
+        LD      (InPos),HL
+        RET
+.zero:
+        XOR     A
+        RET
+
+RefillInBuf:                                ; CF=1 если данных больше нет
+        LD      HL,(CompRemaining)
+        LD      DE,(CompRemaining+2)
+        LD      A,H
+        OR      L
+        OR      D
+        OR      E
+        JR      Z,.none
+        CALL    CompInChunk                 ; BC = min(CompRemaining, InBufLen)
+        PUSH    BC
+        ; --- DSS-чтение на границе: Restore->DSS->Enter, БЕЗ EI (DI весь декод) ---
+        LD      A,(CacheHeld)
+        OR      A
+        CALL    NZ,RestoreSystemWindow
+        LD      HL,InBufBase
+        LD      D,B
+        LD      E,C
+        LD      A,(ArcHandle)
+        LD      C,Dss.Read
+        RST     Dss.Rst
+        CALL    MapDataPages
+        LD      A,(CacheHeld)
+        OR      A
+        CALL    NZ,EnterHeldCacheWindow
+        POP     BC
+        LD      (InCnt),BC
+        LD      HL,0
+        LD      (InPos),HL
+        LD      HL,(CompRemaining)          ; CompRemaining -= BC
+        OR      A
+        SBC     HL,BC
+        LD      (CompRemaining),HL
+        LD      HL,(CompRemaining+2)
+        LD      BC,0
+        SBC     HL,BC
+        LD      (CompRemaining+2),HL
+        OR      A
+        RET
+.none:
+        SCF
+        RET
+
+CompInChunk:                                ; BC = min(CompRemaining, InBufLen)
+        LD      A,(CompRemaining+2)
+        LD      B,A
+        LD      A,(CompRemaining+3)
+        OR      B
+        JR      NZ,.full
+        LD      A,(CompRemaining+1)
+        CP      high(InBufLen)
+        JR      NC,.full
+        LD      BC,(CompRemaining)
+        RET
+.full:
+        LD      BC,InBufLen
+        RET
+
+; ====================================================================
+; Страницы памяти (WIN2/WIN3) под окно и таблицы.
+; ====================================================================
+EnsurePages:
+        LD      A,(PagesReady)
+        OR      A
+        JR      NZ,.ok
+        ; Выделить блок 2 страницы (DSS GetMem) -> A = id блока.
+        LD      B,2
+        LD      C,Dss.GetMem
+        RST     Dss.Rst
+        JR      C,.fail
+        LD      (MemBlock),A
+        ; Разрезолвить id блока в номера физ. страниц (BIOS EMM_FN5
+        ; выгружает список страниц блока в буфер HL) — как в gifview.
+        LD      HL,PageTable
+        LD      C,Bios.Emm_Fn5
+        RST     Bios.Rst
+        JR      C,.fail
+        LD      A,(PageTable)
+        LD      (PhysPage2),A
+        LD      A,(PageTable+1)
+        LD      (PhysPage3),A
+        CALL    MapDataPages
+        LD      A,1
+        LD      (PagesReady),A
+.ok:
+        OR      A
+        RET
+.fail:
+        SCF
+        RET
+
+MapDataPages:
+        LD      A,(PhysPage2)
+        OUT     (PAGE2),A
+        LD      A,(PhysPage3)
+        OUT     (PAGE3),A
+        RET
+
+FreePages:
+        LD      A,(PagesReady)
+        OR      A
+        RET     Z
+        LD      A,(MemBlock)
+        LD      C,Dss.FreeMem              ; освободить блок по id в A
+        RST     Dss.Rst
+        XOR     A
+        LD      (PagesReady),A
+        RET
 
 ; Переменные/буферы декодера lh5 вынесены в BSS-блок в конце unlha.asm
 ; (BitBuf, InCur, ..., InBufBase) — чтобы их нули не попадали в EXE-файл.

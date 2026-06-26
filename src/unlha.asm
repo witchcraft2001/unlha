@@ -1401,7 +1401,11 @@ Crc16Update:
         RET     Z
         LD      A,(CacheHeld)               ; кэш уже держится декодером?
         OR      A
-        JP      NZ,CacheCrc16Update         ; да -> прямой вызов (без Enter/Restore)
+        JR      Z,.cold
+        CP      CacheBankLh5 + 1
+        JP      Z,CacheLh5Crc16Update       ; -lh5- держит SRAM bank 1
+        JP      CacheCrc16Update            ; -lh1- / общий bank 0
+.cold:
         CALL    EnterCacheWindow            ; вне декода: DI/CASH_ON ...
         CALL    CacheCrc16Update            ; SRAM #3A00
         CALL    RestoreSystemWindow         ; ... CASH_OFF (без EI)

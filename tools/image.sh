@@ -31,6 +31,13 @@ if [ -d "$repo_root/test" ]; then
     upper="$(printf '%s' "$base" | tr 'a-z' 'A-Z')"
     mcopy -i "$image_path" -o "$f" "::$upper"
   done
+  mixed_dir="$repo_root/build/mixed"
+  python3 "$repo_root/tools/make_mixed_lha.py" "$mixed_dir"
+  for f in "$mixed_dir"/*.LZH; do
+    [ -f "$f" ] || continue
+    base="$(basename "$f")"
+    mcopy -i "$image_path" -o "$f" "::$base"
+  done
   # .lha — короткое 8.3-имя (длинные имена не влезают в FAT 8.3)
   for f in "$repo_root"/test/*.lha "$repo_root"/test/*.LHA; do
     [ -f "$f" ] || continue

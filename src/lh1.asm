@@ -126,7 +126,7 @@ Lh1Flush:
         CALL    MapDataPages
         LD      A,(CacheHeld)
         OR      A
-        CALL    NZ,EnterCacheWindow
+        CALL    NZ,EnterHeldCacheWindow
         RET
 
 ; ====================================================================

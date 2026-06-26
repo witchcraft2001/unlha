@@ -108,7 +108,7 @@
       трамплинятся по флагу `CacheHeld` (общий битридер с lh5 не затронут).
       Код декодера пока в DRAM (WIN1) — исполняется при CASH_ON без ловушки
       «возврат в SRAM». **Подтверждено на железе 2026-06-15 (CRC OK).**
-      lh5 не трогаем: его таблицы (кольцо 8K + CTable 8K) в 16K SRAM не влезают.
+      Позднее `lh5` вынесен в отдельный SRAM bank 1 (см. 5O-4).
 - [x] Шаг 5C: вычислительное ядро -lh1- (DecodeChar/DecodePosition/Lh1Update/
       Lh1UpdateSwap/Lh1Reconst/Lh1GetWord/Lh1PutWord) вынесено в SRAM-бандл
       (DISP #2200, 901 байт). Ядро не делает DSS — нет ловушки «возврат в SRAM».
@@ -160,8 +160,9 @@
       Restore->DSS->Enter нельзя читать/писать переменные из SRAM WIN0.
       **Ждёт железа** (CRC=OK + ненулевые файлы). Осталось (опц.): `dtables` в SRAM.
 - [~] **5O-4. Ускорить `-lh5-`.** Замечание: кольцо нельзя держать в SRAM (его читает
-      `Dss.Write` при CASH_OFF), CTable+кольцо в 16K SRAM не влезают — полный перенос
-      в SRAM малоэффективен. Поэтому идём алгоритмически в DRAM (как 5O-1).
+      `Dss.Write` при CASH_OFF), но Huffman workspace + горячие фрагменты кода
+      помещаются в отдельный SRAM bank 1. Поэтому кольцо остаётся в DRAM/WIN2,
+      а таблицы/код декода/локальный CRC16 работают из SRAM.
       Раунд 1 (сделано): `OutByteCount` (вызов на каждый выходной байт) — убраны
       избыточные `PUSH/POP HL/DE/BC/AF` (вызывающие на сохранность не полагаются),
       байт держим в C. ~84T/байт.
@@ -172,8 +173,21 @@
       `PUSH/POP HL`, побайтовое сравнение с константой NC=510 без порчи HL. ~21T.
       Раунд 4 (сделано): проверки `j<PtThresh` в `DecodeP` (рантайм-порог) — убраны
       `PUSH/POP HL`, сравнение через A (`LD A,L;SUB E;LD A,H;SBC A,D`) без порчи HL.
-      Сборка чистая. **Ждёт железа.** Дальнейшие резервы lh5 мелкие/большие
-      (вынос цикла в SRAM, CTable в DRAM) — отдача падает.
+      Раунд 5 (сделано): bank-aware cache API (`FastRAM.SLOT0`/`ROM_RG[1:0]`),
+      `lh1` остаётся в bank 0, `lh5` держит CASH_ON на bank 1. Обе SRAM-страницы
+      инициализируются на старте. По BIOS FastRAM страницы выбираются внешним
+      портом `#5C` только при `SYS_PORT.ROM`, поэтому прямой `OUT #8F` убран;
+      вход/выход кэша снова использует полную последовательность
+      `#1FFD/#3C/#FB/#7B`, как в `sprinter-unzip`/`gifview`. Перед CASH_OFF
+      `RestoreSystemWindow` всегда возвращает FastRAM bank0. В bank 1 перенесены Huffman workspace
+      (`CTable/CLeft/CRight/PtTable/PtLeft/PtRight/CLen/PtLen`), `Lh5DecodeLoop`,
+      `DecodeC`/`DecodeP`/`DecodePtCode`, `ReadBlockHeader`/`MakeTable`/helpers и
+      локальный CRC16 code + table (`code before #3E00`, table #3E00/#3F00).
+      DSS-чтение/запись идут через
+      `RestoreSystemWindow` -> DSS -> `EnterHeldCacheWindow`. В образ добавлены
+      синтетические mixed-архивы `MIXL1L5`/`MIXL5L1`/`MIXWPL5`/`MIXL5WP`.
+      Сборка чистая.
+      **Ждёт железа.**
 - [~] **5O-6. Горячий вывод в SRAM.** Сделано: `Lh1PutByte` (вызов на каждый
       выходной байт) оптимизирован (байт в C без PUSH/POP AF; `text_buf[r]` пишется
       по адресу r напрямую, т.к. TextBufBase=#0000) и перенесён в SRAM-бандл.
@@ -182,8 +196,8 @@
       `CacheRemainingZero`; DecodeLh1 (DRAM) делает setup/Enter/init, зовёт
       `CacheLh1Loop`, затем финальный flush/Restore. match-copy оптимизирован
       (text_buf[matchI] по адресу=index, без перезагрузки Lh1MatchI). Теперь ВЕСЬ
-      горячий путь lh1 в SRAM; DRAM только на DSS-границах (трамплины). lh5
-      по-прежнему зовёт DRAM `RemainingZero`. Сборка чистая. **Ждёт железа.**
+      горячий путь lh1 в SRAM; DRAM только на DSS-границах (трамплины). Сборка
+      чистая. **Ждёт железа.**
 - [ ] **5O-5. Крупнее буферы ввода/вывода** — реже DSS-трамплины (мелочь относительно
       поцикловой работы; делать в последнюю очередь).
 **Замечание:** на `-lh1-` догнать unzip нереально (формат тяжелее DEFLATE), но

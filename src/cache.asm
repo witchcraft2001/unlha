@@ -4,12 +4,16 @@
 ;   «Горячий» код и таблицы лежат в EXE (WIN1), копируются в SRAM WIN0
 ;   на старте (InitSramBundle) и исполняются при CASH_ON=1.
 ;
-;   Раскладка SRAM WIN0 (#0000-#3FFF), активна только при CASH_ON=1:
+;   Раскладка SRAM WIN0 (#0000-#3FFF), активна только при CASH_ON=1.
+;   Аппаратно видимый 16K-bank выбирается через FastRAM.SLOT0/ROM_RG[1:0]:
+;     bank 0: -lh1- workspace/code + общий CRC16
+;     bank 1: -lh5- workspace/code + локальный CRC16
+;
+;   Раскладка bank 0:
 ;     #3800-#38FF  CRC16: младшие байты table[256]   (SramCrcTableLo)
 ;     #3900-#39FF  CRC16: старшие байты table[256]    (SramCrcTableHi)
 ;     #3A00-...    кэш-код (DISP-бандл, CacheCrc16Update)
-;   EXE-код/данные/стек в WIN1 (#4200+), поэтому #0000-#37FF в WIN0 пока
-;   свободны под BSS/таблицы декодеров будущих шагов Этапа 5.
+;   Раскладка bank 1 задаётся в lh5.asm.
 ;
 ;   ПРАВИЛА (как в sprinter-unzip/gifview):
 ;   - Пока CASH_ON=1: WIN0 = SRAM; RST #08/#10/#30/#38 и прерывания НЕЛЬЗЯ
@@ -18,13 +22,17 @@
 ;   - WIN1/WIN2/WIN3 при CASH_ON не меняются и доступны (буферы, (Crc16)).
 ; ====================================================================
 
-; Порты управления кэшем (см. CLAUDE.md, sprinter-unzip, gifview).
+; Порты управления кэшем (см. CLAUDE.md, sprinter-unzip, gifview, BIOS FastRAM).
 CacheOnPort     EQU     #FB         ; IN -> CASH_ON = 1 (WIN0 = SRAM)
 CacheOffPort    EQU     #7B         ; IN -> CASH_ON = 0
+FastRamSlot0Port EQU    #5C         ; external FastRAM.SLOT0; works under SYS_PORT_ON
+CacheBankLh1    EQU     #00
+CacheBankLh5    EQU     #01
 SysMapCache     EQU     #04         ; system map -> режим SRAM (OUT #3C)
 SysMapDss       EQU     #03         ; system map -> режим DSS
+SysRomPage0     EQU     #01         ; SYS_PORT_ON data: ROM page numbering 0..15
 IsaSystemDss    EQU     #01         ; ISA system (#1FFD) -> режим DSS
-; SYS_PORT_OFF (#3C) и ISA.System (#1FFD) определены в ports.inc.
+; SYS_PORT_ON/OFF (#7C/#3C) и ISA.System (#1FFD) определены в ports.inc.
 
 ; Раскладка SRAM.
 SramCrcTableLo  EQU     #3800
@@ -38,7 +46,7 @@ SramPageEnd     EQU     #4000
 ; Инициализация SRAM-блока (один раз на старте). Портит AF,BC,DE,HL.
 ; ====================================================================
 InitSramBundle:
-        CALL    EnterCacheWindow
+        CALL    EnterCacheWindowLh1
         LD      HL,CacheCodeStored          ; байты CRC-бандла лежат в EXE (WIN1)
         LD      DE,SramCacheCode            ; -> SRAM WIN0 (#3A00)
         LD      BC,CacheCodeStoredEnd - CacheCodeStored
@@ -47,7 +55,14 @@ InitSramBundle:
         LD      DE,SramLh1Code              ; -> SRAM WIN0 (#2200)
         LD      BC,Lh1CacheStoredEnd - Lh1CacheStored
         LDIR
-        CALL    BuildCrc16Table             ; таблица CRC16 прямо в SRAM
+        CALL    BuildCrc16Table             ; таблица CRC16 прямо в SRAM bank 0
+        CALL    RestoreSystemWindow         ; CASH_OFF (без EI)
+        CALL    EnterCacheWindowLh5
+        LD      HL,Lh5CacheStored           ; весь runtime image -lh5-
+        LD      DE,SramLh5Code              ; -> SRAM bank 1
+        LD      BC,Lh5CacheStoredEnd - Lh5CacheStored
+        LDIR
+        CALL    BuildLh5Crc16Table          ; локальная CRC16-таблица в SRAM bank 1
         CALL    RestoreSystemWindow         ; CASH_OFF (без EI)
         EI                                  ; вернуть обычный поток DSS (EI)
         RET
@@ -56,6 +71,11 @@ InitSramBundle:
 ; Вызывается при CASH_ON=1 (пишет в WIN0). Портит AF,BC,DE,HL.
 BuildCrc16Table:
         LD      HL,SramCrcTableLo           ; H = страница lo, L = индекс
+        JR      BuildCrc16TableAtHL
+
+BuildLh5Crc16Table:
+        LD      HL,SramLh5CrcTableLo        ; H = страница lo, L = индекс
+BuildCrc16TableAtHL:
 .byte:
         LD      A,L                         ; c = index
         LD      E,A
@@ -91,25 +111,71 @@ BuildCrc16Table:
 ; границах верхнего уровня: InitSramBundle, Crc16Update (вне кэша), конец
 ; DecodeLh1. На DSS-границах внутри декода EI не делается (DI держится).
 ; ====================================================================
-; По manual + FPGA (SP2_ACEX.TDF): CASH_ON защёлкивается ТОЛЬКО от IN #FB/#7B
-; (бит A7), SYS-режим DSS не трогаем — он остаётся как выставил DSS, поэтому при
-; CASH_OFF WIN0 видит DSS-ROM (RST #10 работает), а при CASH_ON — SRAM.
-; Портит только AF.
+; По manual + FPGA (SP2_ACEX.TDF): CASH_ON защёлкивается от IN #FB/#7B
+; (бит A7), номер SRAM-bank берётся из ROM_RG[1:0]. В BIOS FastRAM.SLOT0 — это
+; внешний порт #5C, который переключает страницы только при SYS_PORT.ROM (#7C).
+; Прямой OUT #8F здесь не годится: #8F — внутренний DCP-порт.
+; Портит AF.
 EnterCacheWindow:
+EnterCacheWindowLh1:
+        PUSH    BC
         DI                                  ; в кэш-окне прерывания нельзя
+        XOR     A
+        LD      BC,ISA.System
+        OUT     (C),A                       ; #1FFD <- 0, как в sprinter-unzip
+        XOR     A                           ; SRAM bank 0: -lh1-/общий CRC
+        CALL    SelectCacheBank             ; через SYS_PORT_ON + FastRAM.SLOT0
+        LD      A,SysMapCache
+        OUT     (SYS_PORT_OFF),A            ; #3C <- 4, system map для SRAM
         IN      A,(CacheOnPort)             ; CASH_ON = 1 (WIN0 = SRAM)
+        POP     BC
         RET
+
+EnterCacheWindowLh5:
+        PUSH    BC
+        DI
+        XOR     A
+        LD      BC,ISA.System
+        OUT     (C),A                       ; #1FFD <- 0
+        LD      A,CacheBankLh5              ; SRAM bank 1: -lh5-
+        CALL    SelectCacheBank
+        LD      A,SysMapCache
+        OUT     (SYS_PORT_OFF),A            ; #3C <- 4
+        IN      A,(CacheOnPort)             ; CASH_ON = 1
+        POP     BC
+        RET
+
+EnterHeldCacheWindow:
+        LD      A,(CacheHeld)
+        CP      CacheBankLh5 + 1            ; CacheHeld=2 -> -lh5- bank 1
+        JP      Z,EnterCacheWindowLh5
+        JP      EnterCacheWindowLh1
 
 RestoreSystemWindow:                        ; CASH_OFF; прерывания не трогаем
+        PUSH    BC
+        XOR     A                           ; перед CASH_OFF вернуть ROM_RG bank 0
+        CALL    SelectCacheBank
+        LD      A,SysMapCache
+        OUT     (SYS_PORT_OFF),A            ; вернуть cache-map перед IN #7B
         IN      A,(CacheOffPort)            ; CASH_ON = 0 (WIN0 -> DSS-ROM/DRAM)
+        LD      A,SysMapDss
+        OUT     (SYS_PORT_OFF),A            ; #3C <- 3, system map DSS
+        LD      BC,ISA.System
+        LD      A,IsaSystemDss
+        OUT     (C),A                       ; #1FFD <- 1
+        POP     BC
         RET
 
-; --- ОТКАТ, если на железе голого #FB/#7B окажется недостаточно (как уверяют
-;     modplay/gifview/sprinter-unzip для DSS-EXE) — вернуть полную последовательность:
-;   EnterCacheWindow:  PUSH BC / XOR A / LD BC,#1FFD / OUT (C),A / LD A,#04 /
-;                      OUT (#3C),A / DI / IN A,(#FB) / POP BC / RET
-;   RestoreSystemWindow: PUSH BC / IN A,(#7B) / LD A,#03 / OUT (#3C),A /
-;                      LD BC,#1FFD / LD A,#01 / OUT (C),A / POP BC / RET
+; SelectCacheBank: A = 0..3. Переключение FastRAM.SLOT0 (#5C) работает только
+; при SYS_PORT.ROM, поэтому кратко открываем SYS_PORT_ON и сразу возвращаем
+; карту вызывающему коду. Портит только AF.
+SelectCacheBank:
+        PUSH    AF
+        LD      A,SysRomPage0
+        OUT     (SYS_PORT_ON),A
+        POP     AF
+        OUT     (FastRamSlot0Port),A
+        RET
 
 ; ====================================================================
 ; SRAM-бандл: хранится в EXE, копируется в SramCacheCode, исполняется
